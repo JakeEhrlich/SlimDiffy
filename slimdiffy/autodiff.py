@@ -116,6 +116,7 @@ class OpType(Enum):
     # Linear algebra
     MATMUL = 'matmul'
     TRANSPOSE = 'transpose'
+    RESHAPE = 'reshape'
 
     # Reductions
     SUM = 'sum'
@@ -161,6 +162,17 @@ class Tracer:
         self.supervisor = supervisor
         self.idx = supervisor.add_equation(expr)
 
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self.supervisor.equations[self.idx].shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self.supervisor.equations[self.idx].dtype
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
     def _binary_op(self, other, op: OpType) -> 'Tracer':
         other = _ensure_tracer(other, self.supervisor)
         self_expr = self.supervisor.equations[self.idx]
@@ -184,6 +196,33 @@ class Tracer:
         except ValueError:
             raise ValueError(f"Cannot broadcast shape {self_expr.shape} to {shape}")
         return Tracer(Op(OpType.BROADCAST, [self.idx], self_expr.dtype, shape), self.supervisor)
+
+    def reshape(self, *shape: int) -> 'Tracer':
+        """Reshape array to new shape"""
+        self_expr = self.supervisor.equations[self.idx]
+        if -1 in shape:
+            # Calculate size of -1 dimension
+            known_size = 1
+            unknown_idx = None
+            for i, s in enumerate(shape):
+                if s == -1:
+                    if unknown_idx is not None:
+                        raise ValueError("Only one -1 allowed in reshape")
+                    unknown_idx = i
+                else:
+                    known_size *= s
+            assert unknown_idx is not None
+            full_size = np.prod(self_expr.shape)
+            if full_size % known_size != 0:
+                raise ValueError(f"Cannot reshape array of size {full_size} into shape {shape}")
+            shape_list = list(shape)
+            shape_list[unknown_idx] = full_size // known_size
+            shape = tuple(shape_list)
+        else:
+            # Verify shapes are compatible
+            if np.prod(shape) != np.prod(self_expr.shape):
+                raise ValueError(f"Cannot reshape array of size {np.prod(self_expr.shape)} into shape {shape}")
+        return Tracer(Op(OpType.RESHAPE, [self.idx], self_expr.dtype, shape), self.supervisor)
 
     def __add__(self, other):
         return self._binary_op(other, OpType.ADD)
@@ -451,6 +490,9 @@ class Interpreter:
     def visit_op_transpose(self, expr: Op) -> Any:
         return self.results[expr.inputs[0]].T
 
+    def visit_op_reshape(self, expr: Op) -> Any:
+        return np.reshape(self.results[expr.inputs[0]], expr.shape)
+
     def visit_op_broadcast(self, expr: Op) -> Any:
         x = np.asarray(self.results[expr.inputs[0]])
         return np.broadcast_to(x, expr.shape)
@@ -558,7 +600,8 @@ class Transform:
             return supervisor.create_lambda(index_tuple, pt.leaf(result.idx))
         pytree = pt.from_value(result)
         pytree = pt.map(lambda x: x.idx, pytree)
-        return supervisor.create_lambda(index_tuple, pytree)
+        out = supervisor.create_lambda(index_tuple, pytree)
+        return out
 
     def __call__(self, *args, **kwargs):
         bound_args = self.signature.bind(*args, **kwargs)
@@ -588,16 +631,41 @@ class jit(Transform):
     def __init__(self, fn):
         super().__init__(fn)
 
-    def transform(self, transform_fn, *arg_specs):
-        """Helper for applying arbitrary transforms"""
-        lambda_expr = self.get_expr(*arg_specs)
-        return transform_fn(lambda_expr)
-
 class Gradient:
     def __init__(self):
         self.equation_map: list[Tracer] = []
         self.supervisor = TracerSupervisor()
         self.derivatives: defaultdict = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
+
+    def _handle_broadcast_derivative(self, input_idx: int, input_shape: Tuple[int, ...],
+                                   output_shape: Tuple[int, ...], derivative: Tracer) -> None:
+        """Handle summing over broadcasted dimensions for elementwise operations"""
+        # Sum over dimensions that were broadcast for input
+        sum_axes = []
+        len_diff = len(output_shape) - len(input_shape)
+
+        # Handle case where output has more dimensions than input
+        if len_diff > 0:
+            sum_axes.extend(range(len_diff))
+            # Pad input shape with 1's to match output length
+            padded_input_shape = (1,) * len_diff + input_shape
+            # Check remaining dimensions
+            sum_axes.extend(i+len_diff for i, (s1, s2) in
+                          enumerate(zip(padded_input_shape, output_shape[len_diff:]))
+                          if s1 == 1 and s2 > 1)
+        else:
+            # Just check aligned dimensions when shapes same length
+            sum_axes.extend(i for i, (s1, s2) in enumerate(zip(input_shape, output_shape))
+                          if s1 == 1 and s2 > 1)
+
+        if sum_axes:
+            # Keep dims always then reshape at end
+            result = derivative.sum(tuple(sum_axes), keepdims=True)
+            result = result.reshape(*input_shape)
+            self.derivatives[input_idx] += result
+        else:
+            result = derivative.reshape(*input_shape)
+            self.derivatives[input_idx] += result
 
     def visit_literal(self, eq: Literal, derivative: Tracer) -> None:
         # Always 0, nothing upstream of it
@@ -608,66 +676,69 @@ class Gradient:
         pass
 
     def visit_add(self, eq: Op, derivative: Tracer) -> None:
-        for input_idx in eq.inputs:
-            self.derivatives[input_idx] += derivative
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative)
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative)
 
     def visit_mul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self.derivatives[eq.inputs[0]] += derivative * b
-        self.derivatives[eq.inputs[1]] += derivative * a
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * b)
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * a)
 
     def visit_sub(self, eq: Op, derivative: Tracer) -> None:
-        self.derivatives[eq.inputs[0]] += derivative
-        self.derivatives[eq.inputs[1]] += -derivative
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative)
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, -derivative)
 
     def visit_div(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self.derivatives[eq.inputs[0]] += derivative / b
-        self.derivatives[eq.inputs[1]] += -derivative * a / (b * b)
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative / b)
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, -derivative * a / (b * b))
 
     def visit_pow(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self.derivatives[eq.inputs[0]] += derivative * b * a ** (b - 1)
-        self.derivatives[eq.inputs[1]] += derivative * (a ** b) * log(a)
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * b * a ** (b - 1))
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (a ** b) * log(a))
 
     def visit_neg(self, eq: Op, derivative: Tracer) -> None:
-        self.derivatives[eq.inputs[0]] += -derivative
+        input_val = self.equation_map[eq.inputs[0]]
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, -derivative)
 
     def visit_exp(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += derivative * exp(input_val)
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * exp(input_val))
 
     def visit_log(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += derivative / input_val
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative / input_val)
 
     def visit_sin(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += derivative * cos(input_val)
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * cos(input_val))
 
     def visit_cos(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += -derivative * sin(input_val)
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, -derivative * sin(input_val))
 
     def visit_abs(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += derivative * abs(input_val) / input_val
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * abs(input_val) / input_val)
 
     def visit_maximum(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         mask_a = (a > b)
         mask_b = (b > a)
         equal = (a == b)
-        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
-        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
 
     def visit_minimum(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         mask_a = (a < b)
         mask_b = (b < a)
         equal = (a == b)
-        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
-        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
+        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
+        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
 
     def visit_matmul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
@@ -676,6 +747,14 @@ class Gradient:
 
     def visit_transpose(self, eq: Op, derivative: Tracer) -> None:
         self.derivatives[eq.inputs[0]] += derivative.T
+
+    def visit_reshape(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        self.derivatives[eq.inputs[0]] += derivative.reshape(*input_val.shape)
+
+    def visit_broadcast(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative)
 
     def visit_sum(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
@@ -785,6 +864,7 @@ class DeadCodeElimination:
     def __call__(self, lambda_expr: Lambda) -> Lambda:
         """Eliminates dead code from lambda expression"""
         self.equations = lambda_expr.equations
+        self.used_equations = set()
 
         # Mark all equations needed for result
         self.mark_used(lambda_expr.result)
@@ -829,6 +909,9 @@ class CommonSubexpressionElimination:
 
     def __call__(self, lambda_expr: Lambda) -> Lambda:
         """Eliminates common subexpressions from lambda expression"""
+        # Reset state each call
+        self.expr_to_idx = {}
+
         new_equations = []
         old_to_new = {}
 
@@ -857,10 +940,12 @@ class CommonSubexpressionElimination:
 class ConstantFolding:
     def __init__(self):
         self.constants = {}
-        self.interpreter = None
 
     def __call__(self, lambda_expr: Lambda) -> Lambda:
         """Evaluates constant expressions and replaces them with literals"""
+        # Reset state
+        self.constants = {}
+
         new_equations = []
         old_to_new = {}
 
