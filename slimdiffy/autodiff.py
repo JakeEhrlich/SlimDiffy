@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, Union
 import inspect
 from enum import Enum
-import pytree as pt
+import slimdiffy.pytree as pt
 
 @dataclass
 class Var:

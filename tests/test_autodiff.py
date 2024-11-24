@@ -4,8 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import numpy as np # type: ignore
-import autodiff as ad
-import pytree as pt
+import slimdiffy.autodiff as ad
+import slimdiffy.pytree as pt
 import dataclasses
 
 def test_from_to_value():
