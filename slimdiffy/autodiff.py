@@ -7,7 +7,7 @@ import numpy as np # type: ignore
 from collections import defaultdict
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 import inspect
 from enum import Enum
 import slimdiffy.pytree as pt
@@ -44,16 +44,15 @@ class Lambda:
         for i, eq in enumerate(self.equations):
             if isinstance(eq, Op):
                 eq_str = f"v{i} = {eq.op.value}"
-                if eq.op == OpType.REDUCE:
-                    # Special handling for reduce with nested lambda
-                    nested = eq.metadata['lambda']
-                    axes = eq.metadata['axes']
-                    eq_str += f"(v{eq.inputs[0]}, axes={axes}){{\n"
-                    eq_str += nested.render(indent + 2)
-                    eq_str += " " * indent + "}"
+                # Get operator inputs
+                input_strs = [f"v{j}" for j in eq.inputs]
+                # Add axes for reduction ops
+                if eq.op in (OpType.SUM, OpType.PROD, OpType.MIN, OpType.MAX):
+                    eq_str += f"({', '.join(input_strs)}, axes={eq.metadata['axes']}"
+                    if eq.metadata.get('keepdims', False):
+                        eq_str += f", keepdims={eq.metadata['keepdims']}"
+                    eq_str += ")"
                 else:
-                    # Default operator rendering
-                    input_strs = [f"v{j}" for j in eq.inputs]
                     eq_str += f"({', '.join(input_strs)})"
             elif isinstance(eq, Literal):
                 eq_str = f"v{i} = {eq.value}"
@@ -99,19 +98,37 @@ class Lambda:
 
 
 class OpType(Enum):
+    # Basic arithmetic
     ADD = 'add'
-    MUL = 'mul'
     SUB = 'sub'
+    MUL = 'mul'
+    DIV = 'div'
     POW = 'pow'
     NEG = 'neg'
+    BROADCAST = 'broadcast'
+
+    # Comparisons
+    LT = 'lt'
+    GT = 'gt'
+    MAXIMUM = 'maximum'
+    MINIMUM = 'minimum'
+
+    # Linear algebra
+    MATMUL = 'matmul'
+    TRANSPOSE = 'transpose'
+
+    # Reductions
+    SUM = 'sum'
+    PROD = 'prod'
+    MIN = 'min'
+    MAX = 'max'
+
+    # Elementwise functions
     EXP = 'exp'
+    LOG = 'log'
     SIN = 'sin'
     COS = 'cos'
     ABS = 'abs'
-    MATMUL = 'matmul'
-    TRANSPOSE = 'transpose'
-    REDUCE = 'reduce'
-    LOG = 'log'
 
 @dataclass
 class Op:
@@ -141,29 +158,48 @@ class Tracer:
         self.supervisor = supervisor
         self.idx = supervisor.add_equation(expr)
 
-    def __add__(self, other):
+    def _binary_op(self, other, op: OpType) -> 'Tracer':
         other = _ensure_tracer(other, self.supervisor)
         self_expr = self.supervisor.equations[self.idx]
         other_expr = self.supervisor.equations[other.idx]
-        assert self_expr.shape == other_expr.shape
 
-        return Tracer(Op(OpType.ADD, [self.idx, other.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+        try:
+            out_shape = np.broadcast_shapes(self_expr.shape, other_expr.shape)
+        except ValueError:
+            raise ValueError(f"Cannot broadcast shapes {self_expr.shape} and {other_expr.shape}")
+
+        return Tracer(Op(op, [self.idx, other.idx], self_expr.dtype, out_shape), self.supervisor)
+
+    def _unary_op(self, op: OpType) -> 'Tracer':
+        self_expr = self.supervisor.equations[self.idx]
+        return Tracer(Op(op, [self.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+
+    def broadcast_to(self, shape: Tuple[int, ...]) -> 'Tracer':
+        self_expr = self.supervisor.equations[self.idx]
+        try:
+            np.broadcast_shapes(self_expr.shape, shape)
+        except ValueError:
+            raise ValueError(f"Cannot broadcast shape {self_expr.shape} to {shape}")
+        return Tracer(Op(OpType.BROADCAST, [self.idx], self_expr.dtype, shape), self.supervisor)
+
+    def __add__(self, other):
+        return self._binary_op(other, OpType.ADD)
 
     def __radd__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        return other.__add__(self)
+        return self._binary_op(other, OpType.ADD)
 
     def __mul__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        self_expr = self.supervisor.equations[self.idx]
-        other_expr = self.supervisor.equations[other.idx]
-        assert self_expr.shape == other_expr.shape
-
-        return Tracer(Op(OpType.MUL, [self.idx, other.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+        return self._binary_op(other, OpType.MUL)
 
     def __rmul__(self, other):
+        return self._binary_op(other, OpType.MUL)
+
+    def __truediv__(self, other):
+        return self._binary_op(other, OpType.DIV)
+
+    def __rtruediv__(self, other):
         other = _ensure_tracer(other, self.supervisor)
-        return other.__mul__(self)
+        return other._binary_op(self, OpType.DIV)
 
     def __matmul__(self, other):
         other = _ensure_tracer(other, self.supervisor)
@@ -174,8 +210,8 @@ class Tracer:
             raise ValueError("matmul requires 2D arrays")
         if self_expr.shape[1] != other_expr.shape[0]:
             raise ValueError(f"Cannot multiply arrays of shapes {self_expr.shape} and {other_expr.shape}")
-
         out_shape = (self_expr.shape[0], other_expr.shape[1])
+
         return Tracer(Op(OpType.MATMUL, [self.idx, other.idx], self_expr.dtype, out_shape), self.supervisor)
 
     def __rmatmul__(self, other):
@@ -183,58 +219,86 @@ class Tracer:
         return other.__matmul__(self)
 
     def __sub__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        self_expr = self.supervisor.equations[self.idx]
-        other_expr = self.supervisor.equations[other.idx]
-        assert self_expr.shape == other_expr.shape
-
-        return Tracer(Op(OpType.SUB, [self.idx, other.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+        return self._binary_op(other, OpType.SUB)
 
     def __rsub__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        return other.__sub__(self)
+        return self._binary_op(other, OpType.SUB)
 
     def __pow__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        self_expr = self.supervisor.equations[self.idx]
-        other_expr = self.supervisor.equations[other.idx]
-        assert self_expr.shape == other_expr.shape
-
-        return Tracer(Op(OpType.POW, [self.idx, other.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+        return self._binary_op(other, OpType.POW)
 
     def __rpow__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        return other.__pow__(self)
+        return self._binary_op(other, OpType.POW)
 
     def __neg__(self):
-        self_expr = self.supervisor.equations[self.idx]
-        return Tracer(Op(OpType.NEG, [self.idx], self_expr.dtype, self_expr.shape), self.supervisor)
+        return self._unary_op(OpType.NEG)
+
+    def __lt__(self, other):
+        return self._binary_op(other, OpType.LT)
+
+    def __gt__(self, other):
+        return self._binary_op(other, OpType.GT)
+
+    def maximum(self, other):
+        return self._binary_op(other, OpType.MAXIMUM)
+
+    def minimum(self, other):
+        return self._binary_op(other, OpType.MINIMUM)
 
     @property
     def T(self):
         self_expr = self.supervisor.equations[self.idx]
         if len(self_expr.shape) != 2:
             raise ValueError("transpose requires 2D array")
-        new_shape = (self_expr.shape[1], self_expr.shape[0])
-        return Tracer(Op(OpType.TRANSPOSE, [self.idx], self_expr.dtype, new_shape), self.supervisor)
+        return Tracer(Op(OpType.TRANSPOSE, [self.idx], self_expr.dtype,
+                        (self_expr.shape[1], self_expr.shape[0])), self.supervisor)
 
-    def reduce(self, fn: Callable, axes: Tuple[int, ...]):
+    def sum(self, axis=None, keepdims=False):
+        return self._reduction_op(OpType.SUM, axis, keepdims)
+
+    def prod(self, axis=None, keepdims=False):
+        return self._reduction_op(OpType.PROD, axis, keepdims)
+
+    def max(self, axis=None, keepdims=False):
+        return self._reduction_op(OpType.MAX, axis, keepdims)
+
+    def min(self, axis=None, keepdims=False):
+        return self._reduction_op(OpType.MIN, axis, keepdims)
+
+    def _reduction_op(self, op: OpType, axis=None, keepdims=False) -> 'Tracer':
         self_expr = self.supervisor.equations[self.idx]
+        if axis is None:
+            axes = tuple(range(len(self_expr.shape)))
+        elif isinstance(axis, int):
+            axes = (axis,)
+        else:
+            axes = axis
+        if keepdims:
+            new_shape = tuple(1 if i in axes else s for i, s in enumerate(self_expr.shape))
+        else:
+            new_shape = tuple(s for i, s in enumerate(self_expr.shape) if i not in axes)
+        metadata = {'axes': axes, 'keepdims': keepdims}
+        return Tracer(Op(op, [self.idx], self_expr.dtype, new_shape, metadata), self.supervisor)
 
-        new_shape = tuple(s for i, s in enumerate(self_expr.shape) if i not in axes)
+def sum(x, axis=None, keepdims=False):
+    if isinstance(x, Tracer):
+        return x.sum(axis, keepdims=keepdims)
+    return np.sum(x, axis=axis, keepdims=keepdims)
 
-        supervisor = TracerSupervisor()
-        x = Tracer(Var(0, self_expr.dtype, self_expr.shape), supervisor)
-        y = Tracer(Var(1, self_expr.dtype, self_expr.shape), supervisor)
-        result = fn(x, y)
-        assert type(result) is Tracer, "reduce lambda must return an array"
-        assert supervisor.equations[result.idx].shape == ()
-        assert supervisor.equations[result.idx].dtype == self_expr.dtype
-        args = (pt.leaf(0), pt.leaf(1))
-        fn_lambda = supervisor.create_lambda(args, pt.leaf(result.idx))
+def prod(x, axis=None, keepdims=False):
+    if isinstance(x, Tracer):
+        return x.prod(axis, keepdims=keepdims)
+    return np.prod(x, axis=axis, keepdims=keepdims)
 
-        metadata = {'axes': axes, 'lambda': fn_lambda}
-        return Tracer(Op(OpType.REDUCE, [self.idx], self_expr.dtype, new_shape, metadata), self.supervisor)
+def min(x, axis=None, keepdims=False):
+    if isinstance(x, Tracer):
+        return x.min(axis, keepdims=keepdims)
+    return np.min(x, axis=axis, keepdims=keepdims)
+
+def max(x, axis=None, keepdims=False):
+    if isinstance(x, Tracer):
+        return x.max(axis, keepdims=keepdims)
+    return np.max(x, axis=axis, keepdims=keepdims)
 
 def exp(x):
     if isinstance(x, Tracer):
@@ -321,11 +385,26 @@ class Interpreter:
     def visit_op_sub(self, expr: Op) -> Any:
         return self.results[expr.inputs[0]] - self.results[expr.inputs[1]]
 
+    def visit_op_div(self, expr: Op) -> Any:
+        return self.results[expr.inputs[0]] / self.results[expr.inputs[1]]
+
     def visit_op_pow(self, expr: Op) -> Any:
         return self.results[expr.inputs[0]] ** self.results[expr.inputs[1]]
 
     def visit_op_neg(self, expr: Op) -> Any:
         return -self.results[expr.inputs[0]]
+
+    def visit_op_lt(self, expr: Op) -> Any:
+        return self.results[expr.inputs[0]] < self.results[expr.inputs[1]]
+
+    def visit_op_gt(self, expr: Op) -> Any:
+        return self.results[expr.inputs[0]] > self.results[expr.inputs[1]]
+
+    def visit_op_maximum(self, expr: Op) -> Any:
+        return np.maximum(self.results[expr.inputs[0]], self.results[expr.inputs[1]])
+
+    def visit_op_minimum(self, expr: Op) -> Any:
+        return np.minimum(self.results[expr.inputs[0]], self.results[expr.inputs[1]])
 
     def visit_op_exp(self, expr: Op) -> Any:
         return np.exp(self.results[expr.inputs[0]])
@@ -345,15 +424,32 @@ class Interpreter:
     def visit_op_matmul(self, expr: Op) -> Any:
         return self.results[expr.inputs[0]] @ self.results[expr.inputs[1]]
 
-    def visit_op_reduce(self, expr: Op) -> Any:
-        fn = expr.metadata['lambda']
-        axes = expr.metadata['axes']
+    def visit_op_transpose(self, expr: Op) -> Any:
+        return self.results[expr.inputs[0]].T
 
-        def reduction_fn(x, y):
-            interpreter = Interpreter((pt.leaf(x), pt.leaf(y)))
-            return interpreter(fn)
+    def visit_op_broadcast(self, expr: Op) -> Any:
+        x = np.asarray(self.results[expr.inputs[0]])
+        return np.broadcast_to(x, expr.shape)
 
-        return np.reduce(reduction_fn, self.results[expr.inputs[0]], axis=axes) # type: ignore
+    def visit_op_sum(self, expr: Op) -> Any:
+        return np.sum(self.results[expr.inputs[0]],
+                     axis=expr.metadata['axes'],
+                     keepdims=expr.metadata.get('keepdims', False))
+
+    def visit_op_prod(self, expr: Op) -> Any:
+        return np.prod(self.results[expr.inputs[0]],
+                      axis=expr.metadata['axes'],
+                      keepdims=expr.metadata.get('keepdims', False))
+
+    def visit_op_min(self, expr: Op) -> Any:
+        return np.min(self.results[expr.inputs[0]],
+                     axis=expr.metadata['axes'],
+                     keepdims=expr.metadata.get('keepdims', False))
+
+    def visit_op_max(self, expr: Op) -> Any:
+        return np.max(self.results[expr.inputs[0]],
+                     axis=expr.metadata['axes'],
+                     keepdims=expr.metadata.get('keepdims', False))
 
 @dataclass
 class ArgSpec:
@@ -369,36 +465,40 @@ class ArgSpec:
             return ArgSpec(leaf_value.dtype, leaf_value.shape)
         return pt.map(to_argspec, pytree)
 
-class jit:
-    def __init__(self, fn):
-        self.fn = fn
-        self.signature = inspect.signature(fn)
+class Transform:
+    """Base class for function transformations like jit and grad"""
+    def __init__(self, fn, transforms=()):
+        # If fn is already a Transform, compose the transforms
+        if isinstance(fn, Transform):
+            self.fn = fn.fn
+            self.signature = fn.signature
+            self.transforms = fn.transforms + transforms
+        else:
+            self.fn = fn
+            self.signature = inspect.signature(fn)
+            self.transforms = transforms
 
     @staticmethod
     def unindex_pytree(index_tree: pt.Node, values: Tuple[Any, ...]) -> pt.Node:
         def unindex(idx: int):
             return values[idx]
-
         return pt.map(unindex, index_tree)
 
     @staticmethod
     def index_pytrees(*pytrees: pt.Node) -> Tuple[pt.Node, ...]:
         """Replaces leaves in pytrees with unique indices"""
         next_idx = 0
-
         def assign_index(trees: Any) -> int:
             nonlocal next_idx
             idx = next_idx
             next_idx += 1
             return idx
-
         return tuple(pt.map(assign_index, tree) for tree in pytrees)
 
     @staticmethod
     def get_values_from_index_tree(value_tree: Union[pt.Node, Tuple], index_tree: Union[pt.Node, Tuple]) -> Tuple[Any, ...]:
         """Extracts values from value_tree based on indices in index_tree"""
         values: List[Any] = []
-
         def assign_value(value: Any, index: int) -> None:
             nonlocal values
             while len(values) <= index:
@@ -412,14 +512,28 @@ class jit:
             assert isinstance(value_tree, pt.Node)
             assert isinstance(index_tree, pt.Node)
             pt.map(assign_value, value_tree, index_tree)
-
         return tuple(values)
+
+    def get_expr(self, *arg_specs):
+        """Get expression graph for function given input specs"""
+        supervisor = TracerSupervisor()
+        full_tree = pt.from_sequence(arg_specs)
+        index_tree, = self.index_pytrees(full_tree)
+        def make_var(arg_spec, arg_index):
+            return Tracer(Var(arg_index, arg_spec.dtype, arg_spec.shape), supervisor)
+        trace_vars = pt.map(make_var, full_tree, index_tree).to_value()
+        result = self.fn(*trace_vars)
+        index_tuple = index_tree.to_sequence()
+        assert isinstance(index_tuple, Tuple)
+        if isinstance(result, Tracer):
+            return supervisor.create_lambda(index_tuple, pt.leaf(result.idx))
+        pytree = pt.from_value(result)
+        pytree = pt.map(lambda x: x.idx, pytree)
+        return supervisor.create_lambda(index_tuple, pytree)
 
     def __call__(self, *args, **kwargs):
         bound_args = self.signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
-
-        # Get pytree specs for this call
         arg_trees = []
         arg_specs = []
         for arg in bound_args.arguments.values():
@@ -427,98 +541,121 @@ class jit:
             spec = ArgSpec.from_pytree(node)
             arg_trees.append(node)
             arg_specs.append(spec)
+        lambda_expr = self.get_expr(*arg_specs)
+        for transform in self.transforms:
+            lambda_expr = transform(lambda_expr)
+        return Interpreter(tuple(arg_trees))(lambda_expr)
 
-        # Use transform with interpreter
-        return self.transform(Interpreter(tuple(arg_trees)), *arg_specs)
+class grad(Transform):
+    def __init__(self, fn):
+        super().__init__(fn, transforms=(
+            Gradient(),
+            CommonSubexpressionElimination(),
+            ConstantFolding(),
+            DeadCodeElimination()
+        ))
 
-    def get_expr(self, *arg_specs):
-        """
-        Get the expression graph for the function given input specs.
-        arg_specs should be PyTreeNodes of ArgSpecs
-        Returns a Lambda containing the full computation graph.
-        """
-        supervisor = TracerSupervisor()
-
-        # Create traced inputs
-        full_tree = pt.from_sequence(arg_specs)
-        index_tree, = self.index_pytrees(full_tree)
-        def make_var(arg_spec, arg_index):
-            return Tracer(Var(arg_index, arg_spec.dtype, arg_spec.shape), supervisor)
-        trace_vars = pt.map(make_var, full_tree, index_tree).to_value()
-
-        # Run function with traced inputs
-        result = self.fn(*trace_vars)
-        if isinstance(result, Tracer):
-            return supervisor.create_lambda(index_tree.to_sequence(), pt.leaf(result.idx)) # type: ignore
-
-        pytree = pt.from_value(result)
-        pytree = pt.map(lambda x: x.idx, pytree)
-
-        return supervisor.create_lambda(index_tree.to_sequence(), pytree) #type: ignore
+class jit(Transform):
+    def __init__(self, fn):
+        super().__init__(fn)
 
     def transform(self, transform_fn, *arg_specs):
-        """Apply a transformation function to the expression graph"""
+        """Helper for applying arbitrary transforms"""
         lambda_expr = self.get_expr(*arg_specs)
         return transform_fn(lambda_expr)
 
 class Gradient:
     def __init__(self):
-        #self.derivatives = defaultdict(lambda: np.array(0))
         self.equation_map: list[Tracer] = []
         self.supervisor = TracerSupervisor()
+        self.derivatives: defaultdict = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
 
-    def visit_literal(self, eq, derivative):
+    def visit_literal(self, eq: Literal, derivative: Tracer) -> None:
         # Always 0, nothing upstream of it
         pass
 
-    def visit_var(self, eq, derivative):
+    def visit_var(self, eq: Var, derivative: Tracer) -> None:
         # Always 1, nothing upstream of it
         pass
 
-    def visit_add(self, eq, derivative):
+    def visit_add(self, eq: Op, derivative: Tracer) -> None:
         for input_idx in eq.inputs:
             self.derivatives[input_idx] += derivative
 
-    def visit_mul(self, eq, derivative):
+    def visit_mul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         self.derivatives[eq.inputs[0]] += derivative * b
         self.derivatives[eq.inputs[1]] += derivative * a
 
-    def visit_sub(self, eq, derivative):
+    def visit_sub(self, eq: Op, derivative: Tracer) -> None:
         self.derivatives[eq.inputs[0]] += derivative
         self.derivatives[eq.inputs[1]] += -derivative
 
-    def visit_pow(self, eq, derivative):
-        # d/dx(a^b) = b * a^(b-1) * d/dx(a) + a^b * ln(a) * d/dx(b)
+    def visit_div(self, eq: Op, derivative: Tracer) -> None:
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        self.derivatives[eq.inputs[0]] += derivative / b
+        self.derivatives[eq.inputs[1]] += -derivative * a / (b * b)
+
+    def visit_pow(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         self.derivatives[eq.inputs[0]] += derivative * b * a ** (b - 1)
         self.derivatives[eq.inputs[1]] += derivative * (a ** b) * log(a)
 
-    def visit_neg(self, eq, derivative):
-        # d/dx(-a) = -d/dx(a)
+    def visit_neg(self, eq: Op, derivative: Tracer) -> None:
         self.derivatives[eq.inputs[0]] += -derivative
 
-    def visit_exp(self, eq, derivative):
-        # d/dx(exp(a)) = exp(a) * d/dx(a)
+    def visit_exp(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += derivative * exp(input_val)
 
-    def visit_log(self, eq, derivative):
-        # d/dx(log(a)) = 1/a * d/dx(a)
+    def visit_log(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += derivative / input_val
 
-    def visit_sin(self, eq, derivative):
-        # d/dx(sin(a)) = cos(a) * d/dx(a)
+    def visit_sin(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += derivative * cos(input_val)
 
-    def visit_cos(self, eq, derivative):
-        # d/dx(cos(a)) = -sin(a) * d/dx(a)
+    def visit_cos(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += -derivative * sin(input_val)
 
-    def visit_op(self, eq: Op, derivative):
+    def visit_abs(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        self.derivatives[eq.inputs[0]] += derivative * abs(input_val) / input_val
+
+    def visit_matmul(self, eq: Op, derivative: Tracer) -> None:
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        self.derivatives[eq.inputs[0]] += derivative @ b.T
+        self.derivatives[eq.inputs[1]] += a.T @ derivative
+
+    def visit_transpose(self, eq: Op, derivative: Tracer) -> None:
+        self.derivatives[eq.inputs[0]] += derivative.T
+
+    def visit_sum(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        output_shape = input_val.supervisor.equations[input_val.idx].shape
+        self.derivatives[eq.inputs[0]] += derivative.broadcast_to(output_shape)
+
+    def visit_prod(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        axes = eq.metadata['axes']
+        reduced = prod(input_val, axis=axes, keepdims=True)
+        self.derivatives[eq.inputs[0]] += derivative * reduced / input_val
+
+    def visit_min(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        axes = eq.metadata['axes']
+        mask = (input_val == min(input_val, axis=axes, keepdims=True))
+        self.derivatives[eq.inputs[0]] += derivative * mask
+
+    def visit_max(self, eq: Op, derivative: Tracer) -> None:
+        input_val = self.equation_map[eq.inputs[0]]
+        axes = eq.metadata['axes']
+        mask = (input_val == max(input_val, axis=axes, keepdims=True))
+        self.derivatives[eq.inputs[0]] += derivative * mask
+
+    def visit_op(self, eq: Op, derivative: Tracer) -> None:
         method = f'visit_{eq.op.value}'
         visitor = getattr(self, method)
         visitor(eq, derivative)
@@ -531,14 +668,14 @@ class Gradient:
 
         result = lambda_expr.result.leaf_value
 
-        # reinit supervisor
+        # reinit supervisor and derivatives
         self.supervisor = TracerSupervisor()
+        self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
 
-        # Copy over original equations, re-initing
+        # Copy over original equations
         self.equation_map = [Tracer(eq, self.supervisor) for eq in lambda_expr.equations]
 
         # Initialize derivative of result wrt result as 1.0
-        self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
         self.derivatives[result] = _ensure_tracer(1.0, self.supervisor)
 
         # Work backwards through equations propagating derivatives
@@ -773,15 +910,6 @@ class AlgebraicSimplification:
 
         return Lambda(lambda_expr.args, self.new_equations, new_result)
 
-# Example global variables
-m = 3
-g = 10
-
-# Example usage
-@jit
-def f(q):
-    return 0.5*m*q[0]**2 - m*g*q[1]
-
 def transform_pipeline(*transforms):
     def apply_transforms(lmd):
         result = lmd
@@ -790,16 +918,32 @@ def transform_pipeline(*transforms):
         return result
     return apply_transforms
 
-grad_opt = transform_pipeline(
-    Gradient(),
-    CommonSubexpressionElimination(),
-    AlgebraicSimplification(),
-    ConstantFolding(),
-    DeadCodeElimination(),
-)
+if __name__ == '__main__':
+    from dataclasses import dataclass
 
-# Get expression for specific input types
-spec = ArgSpec.from_pytree(pt.from_value((np.array(1.0), np.array(1.0))))
-expr = f.get_expr(spec)
-print(expr)
-print(f.transform(grad_opt, spec))
+    @dataclass
+    class Model:
+        weights: np.ndarray
+        bias: np.ndarray
+
+    @jit
+    def loss(model, inputs):
+        # Compute neural network output
+        hidden = inputs @ model.weights + model.bias
+        output = sin(hidden)
+        return sum(output**2)
+
+    # Create model and inputs
+    model = Model(
+        weights=np.array([[1., 2.], [3., 4.]]),
+        bias=np.array([0.1, 0.2])
+    )
+    inputs = np.array([[0.5, 0.6]])
+
+    # Get gradient of loss w.r.t. model params
+    loss_grad = grad(loss)
+
+    (dmodel, dinputs) = loss_grad(model, inputs)
+
+    print("dweights =", dmodel.weights)
+    print("dbias =", dmodel.bias)

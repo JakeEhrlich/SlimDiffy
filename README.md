@@ -25,7 +25,7 @@ Basic example of taking gradients through a function:
 
 ```python
 import numpy as np
-import autodiff as ad
+import slimdiffy.autodiff as ad
 
 @ad.jit
 def f(x, y):
@@ -36,16 +36,11 @@ x = np.array([[1., 2.], [3., 4.]])
 y = np.array([[5., 6.], [7., 8.]])
 
 # Get gradient function
-grad_f = ad.transform_pipeline(ad.Gradient())
-expr = f.get_expr(x, y)
-grad = f.transform(grad_f, x, y)
+grad_f = ad.grad(f)
+result = grad_f(x, y)
 
-# Can evaluate the gradient with interpreter
-interpreter = ad.Interpreter((x, y))
-dx, dy = interpreter(grad)
-
-print("dx =", dx)
-print("dy =", dy)
+print("dx =", result[0])
+print("dy =", result[1])
 ```
 
 More complex example with nested structures:
@@ -63,7 +58,7 @@ def loss(model, inputs):
     # Compute neural network output
     hidden = inputs @ model.weights + model.bias
     output = ad.sin(hidden)
-    return np.sum(output**2)
+    return ad.sum(output**2)
 
 # Create model and inputs
 model = Model(
@@ -73,18 +68,7 @@ model = Model(
 inputs = np.array([[0.5, 0.6]])
 
 # Get gradient of loss w.r.t. model params
-grad_loss = ad.transform_pipeline(
-    ad.Gradient(),
-    ad.CommonSubexpressionElimination(),
-    ad.ConstantFolding(),
-    ad.DeadCodeElimination()
-)
-
-expr = loss.get_expr(model, inputs)
-grad = loss.transform(grad_loss, model, inputs)
-
-interpreter = ad.Interpreter((model, inputs))
-dmodel = interpreter(grad)
+dmodel, dinputs = ad.grad(loss)(model, inputs)
 
 print("dweights =", dmodel.weights)
 print("dbias =", dmodel.bias)
@@ -95,7 +79,6 @@ print("dbias =", dmodel.bias)
 - WebAssembly compilation target
 - Numpy operations coverage expansion
 - Performance optimizations
-- Multi-device support
 
 ## License
 
