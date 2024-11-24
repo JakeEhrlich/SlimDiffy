@@ -130,6 +130,9 @@ class OpType(Enum):
     COS = 'cos'
     ABS = 'abs'
 
+    # IO operations
+    IO_CALLBACK = 'io_callback'
+
 @dataclass
 class Op:
     op: OpType
@@ -279,6 +282,27 @@ class Tracer:
             new_shape = tuple(s for i, s in enumerate(self_expr.shape) if i not in axes)
         metadata = {'axes': axes, 'keepdims': keepdims}
         return Tracer(Op(op, [self.idx], self_expr.dtype, new_shape, metadata), self.supervisor)
+
+def io_callback(x, fn):
+    if isinstance(x, Tracer):
+        self_expr = x.supervisor.equations[x.idx]
+        return Tracer(Op(OpType.IO_CALLBACK, [x.idx], self_expr.dtype, self_expr.shape,
+                        metadata={'callback': fn}), x.supervisor)
+    return fn(x)
+
+def minimum(x, other):
+    if isinstance(x, Tracer):
+        return x.minimum(other)
+    if isinstance(other, Tracer):
+        return other.minimum(x)
+    return np.minimum(x, other)
+
+def maximum(x, other):
+    if isinstance(x, Tracer):
+        return x.maximum(other)
+    if isinstance(other, Tracer):
+        return other.maximum(x)
+    return np.maximum(x, other)
 
 def sum(x, axis=None, keepdims=False):
     if isinstance(x, Tracer):
@@ -430,6 +454,11 @@ class Interpreter:
     def visit_op_broadcast(self, expr: Op) -> Any:
         x = np.asarray(self.results[expr.inputs[0]])
         return np.broadcast_to(x, expr.shape)
+
+    def visit_op_io_callback(self, expr: Op) -> Any:
+        input_values = [self.results[i] for i in expr.inputs]
+        expr.metadata['callback'](*input_values)
+        return np.nan
 
     def visit_op_sum(self, expr: Op) -> Any:
         return np.sum(self.results[expr.inputs[0]],
@@ -624,6 +653,22 @@ class Gradient:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += derivative * abs(input_val) / input_val
 
+    def visit_maximum(self, eq: Op, derivative: Tracer) -> None:
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        mask_a = (a > b)
+        mask_b = (b > a)
+        equal = (a == b)
+        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
+        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
+
+    def visit_minimum(self, eq: Op, derivative: Tracer) -> None:
+        a, b = [self.equation_map[idx] for idx in eq.inputs]
+        mask_a = (a < b)
+        mask_b = (b < a)
+        equal = (a == b)
+        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
+        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
+
     def visit_matmul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         self.derivatives[eq.inputs[0]] += derivative @ b.T
@@ -716,6 +761,9 @@ class DeadCodeElimination:
                 # Recursively mark inputs
                 eq = self.equations[result]
                 if isinstance(eq, Op):
+                    # Always include IO callbacks even if otherwise unused
+                    if eq.op == OpType.IO_CALLBACK:
+                        self.used_equations.add(result)
                     for input_idx in eq.inputs:
                         self.mark_used(input_idx)
                 elif isinstance(eq, Var):
@@ -740,6 +788,11 @@ class DeadCodeElimination:
 
         # Mark all equations needed for result
         self.mark_used(lambda_expr.result)
+
+        # Add all IO callback ops and their dependencies even if otherwise unused
+        for i, eq in enumerate(lambda_expr.equations):
+            if isinstance(eq, Op) and eq.op == OpType.IO_CALLBACK:
+                self.mark_used(i)
 
         # Create new equations list with only used equations
         new_equations = []

@@ -434,3 +434,137 @@ def test_constant_folding():
     orig_result = interpreter(expr)
     opt_result = interpreter(optimized)
     assert abs(orig_result - opt_result) < 1e-6
+
+def test_gradient_descent():
+    # Create function x^2 + y^2 which has a minimum at (0,0)
+    @ad.jit
+    def f(x, y):
+        return x**2 + y**2
+
+    # Starting point
+    x = np.array(2.0)
+    y = np.array(3.0)
+    learning_rate = 0.1
+
+    for _ in range(100):
+        # Get gradients
+        (dx, dy) = ad.grad(f)(x, y)
+
+        # Update parameters
+        x = x - learning_rate * dx
+        y = y - learning_rate * dy
+
+    # Should be very close to minimum at (0,0)
+    assert abs(x) < 1e-4
+    assert abs(y) < 1e-4
+
+def test_gradient_descent_array():
+    # Create function that sums squares of array elements
+    @ad.jit
+    def f(x):
+        return ad.sum(x**2)
+
+    # Starting point - 100 element array of random values
+    x = np.random.randn(100) * 10
+    learning_rate = 0.1
+
+    for _ in range(100):
+        # Get gradient
+        dx = ad.grad(f)(x)
+
+        # Update parameters
+        x = x - learning_rate * dx
+
+    # All elements should be very close to 0
+    assert np.all(np.abs(x) < 1e-4)
+
+def test_softmax():
+    # Test computing softmax function
+    @ad.jit
+    def f(x):
+        x_shifted = x - ad.max(x)
+        exp_x = ad.exp(x_shifted)
+        return exp_x / ad.sum(exp_x)
+
+    # Test uniform distribution (all logits equal)
+    x_uniform = np.ones(5)
+    p_uniform = f(x_uniform)
+    expected_uniform = np.ones(5) / 5
+    assert np.allclose(p_uniform, expected_uniform)
+
+    # Test half logits zero, half one
+    x_half = np.array([1.0, 1.0, -np.inf, -np.inf])
+    p_half = f(x_half)
+    expected_half = np.array([0.5, 0.5, 0.0, 0.0])
+    assert np.allclose(p_half, expected_half)
+
+    # Test delta distribution (one hot)
+    x_delta = np.array([10.0, -np.inf, -np.inf])
+    p_delta = f(x_delta)
+    expected_delta = np.array([1.0, 0.0, 0.0])
+    assert np.allclose(p_delta, expected_delta)
+
+    # Test ascending values
+    x_ascending = np.array([1.0, 2.0, 3.0])
+    p_ascending = f(x_ascending)
+    total = np.exp(0.0) + np.exp(1.0) + np.exp(2.0)
+    expected_ascending = np.array([
+        np.exp(0.0)/total,
+        np.exp(1.0)/total,
+        np.exp(2.0)/total
+    ])
+    assert np.allclose(p_ascending, expected_ascending)
+
+def test_entropy():
+    # Test maximizing entropy to get uniform distribution
+    @ad.jit
+    def f(x):
+        # Subtract max for numerical stability
+        shifted = x - ad.max(x)
+        # Compute softmax
+        exp_x = ad.exp(shifted)
+        softmax = exp_x / ad.sum(exp_x)
+        # Compute negative entropy
+        return ad.sum(softmax * ad.maximum(-1e8, ad.log(softmax)))
+
+    # Test loss values for different distributions
+    # All ones -> uniform distribution
+    x_uniform = np.ones(10)
+    loss_uniform = f(x_uniform)
+    expected_uniform = -np.log(10) # Maximum entropy case
+    assert abs(loss_uniform - expected_uniform) < 1e-4
+
+    # Half ones, half zeros -> half uniform
+    x_half = np.array([1.0]*5 + [-np.inf]*5)
+    loss_half = f(x_half)
+    expected_half = -np.log(5) # Half entropy case
+    print(loss_half)
+    assert abs(loss_half - expected_half) < 1e-4
+
+    # Single one -> delta distribution
+    x_single = np.array([-np.inf]*10)
+    x_single[0] = 1.0
+    loss_single = f(x_single)
+    expected_single = 0.0 # Minimum entropy case
+    assert abs(loss_single - expected_single) < 1e-4
+
+    # Test gradient descent convergence
+    x = np.random.randn(10) * 10
+    learning_rate = 0.1
+
+    for _ in range(1000):
+        # Get gradient
+        print(f(x))
+        dx = ad.grad(f)(x)
+
+
+        # Update parameters
+        x = x - learning_rate * dx
+
+        # Normalize to sum to 1, gives better learning dynamics
+        x = x * (1 / np.sum(x))
+
+    # Softmax of result should be close to uniform (0.1 each)
+    exp_x = np.exp(x - np.max(x))
+    softmax = exp_x / np.sum(exp_x)
+    assert np.allclose(softmax, np.ones_like(x) / len(x), atol=1e-4)
