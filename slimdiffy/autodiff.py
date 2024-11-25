@@ -211,7 +211,7 @@ class Tracer:
                     unknown_idx = i
                 else:
                     known_size *= s
-            assert unknown_idx is not None
+            assert isinstance(unknown_idx, int)
             full_size = np.prod(self_expr.shape)
             if full_size % known_size != 0:
                 raise ValueError(f"Cannot reshape array of size {full_size} into shape {shape}")
@@ -548,6 +548,7 @@ class Transform:
             self.fn = fn
             self.signature = inspect.signature(fn)
             self.transforms = transforms
+        self.expr_cache = {}
 
     @staticmethod
     def unindex_pytree(index_tree: pt.Node, values: Tuple[Any, ...]) -> pt.Node:
@@ -587,6 +588,11 @@ class Transform:
 
     def get_expr(self, *arg_specs):
         """Get expression graph for function given input specs"""
+        # Create key from arg_specs for caching
+        frozen_specs = pt.freeze(pt.from_sequence(arg_specs).to_value())
+        if frozen_specs in self.expr_cache:
+            return self.expr_cache[frozen_specs]
+
         supervisor = TracerSupervisor()
         full_tree = pt.from_sequence(arg_specs)
         index_tree, = self.index_pytrees(full_tree)
@@ -597,11 +603,15 @@ class Transform:
         index_tuple = index_tree.to_sequence()
         assert isinstance(index_tuple, Tuple)
         if isinstance(result, Tracer):
-            return supervisor.create_lambda(index_tuple, pt.leaf(result.idx))
-        pytree = pt.from_value(result)
-        pytree = pt.map(lambda x: x.idx, pytree)
-        out = supervisor.create_lambda(index_tuple, pytree)
-        return out
+            lambda_expr = supervisor.create_lambda(index_tuple, pt.leaf(result.idx))
+        else:
+            pytree = pt.from_value(result)
+            pytree = pt.map(lambda x: x.idx, pytree)
+            lambda_expr = supervisor.create_lambda(index_tuple, pytree)
+
+        # Cache and return the result
+        self.expr_cache[frozen_specs] = lambda_expr
+        return lambda_expr
 
     def __call__(self, *args, **kwargs):
         bound_args = self.signature.bind(*args, **kwargs)
@@ -624,6 +634,7 @@ class grad(Transform):
             Gradient(),
             CommonSubexpressionElimination(),
             ConstantFolding(),
+            AlgebraicSimplification(),
             DeadCodeElimination()
         ))
 

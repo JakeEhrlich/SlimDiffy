@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, Union
 
@@ -150,7 +151,7 @@ def from_value(x: Any) -> Node:
 
 def freeze(x: Any) -> Any:
     """Converts a value into an immutable form suitable for dictionary keys"""
-    if isinstance(x, (str, int, float, bool, complex, bytes, type(None))):
+    if isinstance(x, (str, int, float, bool, complex, bytes, type(None), np.dtype)):
         return x
     elif isinstance(x, (list, tuple)):
         return tuple(freeze(v) for v in x)
