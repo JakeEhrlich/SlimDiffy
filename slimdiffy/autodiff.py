@@ -643,11 +643,14 @@ class jit(Transform):
         super().__init__(fn)
 
 class Gradient:
-    def __init__(self):
+    def __init__(self, gradient_only=True, wrt_args=None):
         self.equation_map: list[Tracer] = []
         self.supervisor = TracerSupervisor()
         self.derivatives: defaultdict = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
+        self.gradient_only = gradient_only
+        self.wrt_args = wrt_args
 
+    # TODO: Update this for jacobians
     def _handle_broadcast_derivative(self, input_idx: int, input_shape: Tuple[int, ...],
                                    output_shape: Tuple[int, ...], derivative: Tracer) -> None:
         """Handle summing over broadcasted dimensions for elementwise operations"""
@@ -751,14 +754,19 @@ class Gradient:
         self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
         self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
 
+    # TODO: Update this for jacobians
     def visit_matmul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         self.derivatives[eq.inputs[0]] += derivative @ b.T
         self.derivatives[eq.inputs[1]] += a.T @ derivative
 
+    # TODO: Update this for jacobians and generally just things
+    #       that are not 2-tensors...will require updating transpose
     def visit_transpose(self, eq: Op, derivative: Tracer) -> None:
         self.derivatives[eq.inputs[0]] += derivative.T
 
+    # TODO: Update this for jacobians, will only require reshaping
+    #       the input dims
     def visit_reshape(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self.derivatives[eq.inputs[0]] += derivative.reshape(*input_val.shape)
@@ -767,6 +775,7 @@ class Gradient:
         input_val = self.equation_map[eq.inputs[0]]
         self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative)
 
+    # TODO: gotta get the shape right here
     def visit_sum(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         output_shape = input_val.supervisor.equations[input_val.idx].shape
@@ -796,46 +805,70 @@ class Gradient:
         visitor(eq, derivative)
 
     def __call__(self, lambda_expr: Lambda) -> Lambda:
-        """Generates gradient of lambda expression with respect to inputs"""
-        # Verify result is a scalar
-        if not (isinstance(lambda_expr.result, pt.Node) and lambda_expr.result.leaf_value is not None):
-            raise ValueError("Can only take gradient of scalar-valued functions")
+        """Generates gradient/jacobian of lambda expression with respect to inputs"""
+        # Verify shape based on gradient_only
+        if self.gradient_only and not lambda_expr.result.leaf_value is not None:
+            raise ValueError("gradient_only=True requires scalar-valued functions")
 
-        result = lambda_expr.result.leaf_value
-
-        # reinit supervisor and derivatives
-        self.supervisor = TracerSupervisor()
-        self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
+        # Get result node(s)
+        results = []
+        pt.map(lambda node: results.append(node.leaf_value), lambda_expr.result)
 
         # Copy over original equations
         self.equation_map = [Tracer(eq, self.supervisor) for eq in lambda_expr.equations]
 
-        # Initialize derivative of result wrt result as 1.0
-        self.derivatives[result] = _ensure_tracer(1.0, self.supervisor)
+        # Filter args if specified
+        if self.wrt_args is not None:
+            active_args = [i in self.wrt_args for i in range(len(lambda_expr.args))]
+        else:
+            active_args = [True] * len(lambda_expr.args)
 
-        # Work backwards through equations propagating derivatives
-        for i in range(len(lambda_expr.equations)-1, -1, -1):
-            if i not in self.derivatives:
-                continue
-            eq = lambda_expr.equations[i]
-            derivative = self.derivatives[i]
+        # Compute derivatives for each output
+        all_derivatives = []
+        for result_idx in results:
+            # reinit derivatives for this output
+            self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
 
-            if isinstance(eq, Op):
-                self.visit_op(eq, derivative)
-            else:
+            # Initialize derivative of result wrt result as 1.0
+            self.derivatives[result_idx] = _ensure_tracer(1.0, self.supervisor)
+
+            # Work backwards through equations propagating derivatives
+            for i in range(len(lambda_expr.equations)-1, -1, -1):
+                if i not in self.derivatives:
+                    continue
+                eq = lambda_expr.equations[i]
+                derivative = self.derivatives[i]
+
                 method = f'visit_{type(eq).__name__.lower()}'
                 visitor = getattr(self, method)
                 visitor(eq, derivative)
 
-        def to_grad(idx):
-            return self.derivatives[idx].idx
-        result = tuple(pt.map(to_grad, arg) for arg in lambda_expr.args)
+            # Collect derivatives for this output
+            def to_grad(idx):
+                return self.derivatives[idx].idx
+            derivatives = tuple(pt.map(to_grad, arg) for i, arg in enumerate(lambda_expr.args)
+                             if active_args[i])
+            all_derivatives.append(derivatives)
 
-        # Return lambda that computes all input derivatives
-        if len(result) == 1:
-            result = result[0]
+        # Create result based on gradient_only
+        if self.gradient_only:
+            assert len(all_derivatives) == 1
+            result = all_derivatives[0]
+            assert isinstance(result, tuple)
+            # Pack into tuple/sequence if needed
+            # TODO: This is irregular, we should add an option
+            # to disable it for regularity
+            if len(lambda_expr.args) == 1:
+                result = result[0]
+            else:
+                result = pt.from_sequence(tuple(result))
         else:
-            result = pt.from_sequence(result)
+            # Create tree of jacobians
+            def make_jacobian_node(out_node):
+                output_idx = results.index(out_node.leaf_value)
+                return all_derivatives[output_idx]
+            result = pt.map(make_jacobian_node, lambda_expr.result)
+
         return self.supervisor.create_lambda(lambda_expr.args, result)
 
 class DeadCodeElimination:
