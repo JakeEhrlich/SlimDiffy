@@ -114,7 +114,7 @@ class OpType(Enum):
     MINIMUM = 'minimum'
 
     # Linear algebra
-    MATMUL = 'matmul'
+    DOT = 'dot'
     TRANSPOSE = 'transpose'
     RESHAPE = 'reshape'
 
@@ -155,6 +155,8 @@ class TracerSupervisor:
         return len(self.equations) - 1
 
     def create_lambda(self, args: Tuple[pt.Node, ...], result: pt.Node) -> Lambda:
+        assert all(isinstance(arg, pt.Node) for arg in args)
+        assert isinstance(result, pt.Node)
         return Lambda(args, self.equations, result)
 
 class Tracer:
@@ -191,6 +193,9 @@ class Tracer:
 
     def broadcast_to(self, shape: Tuple[int, ...]) -> 'Tracer':
         self_expr = self.supervisor.equations[self.idx]
+        # If shapes match exactly, no need to broadcast
+        if self_expr.shape == shape:
+            return self
         try:
             np.broadcast_shapes(self_expr.shape, shape)
         except ValueError:
@@ -216,25 +221,52 @@ class Tracer:
             if full_size % known_size != 0:
                 raise ValueError(f"Cannot reshape array of size {full_size} into shape {shape}")
             shape_list = list(shape)
-            shape_list[unknown_idx] = full_size // known_size
+            shape_list[unknown_idx] = int(full_size) // known_size
             shape = tuple(shape_list)
         else:
             # Verify shapes are compatible
             if np.prod(shape) != np.prod(self_expr.shape):
                 raise ValueError(f"Cannot reshape array of size {np.prod(self_expr.shape)} into shape {shape}")
+            # If shape matches exactly, no need to reshape
+            if shape == self_expr.shape:
+                return self
         return Tracer(Op(OpType.RESHAPE, [self.idx], self_expr.dtype, shape), self.supervisor)
 
     def __add__(self, other):
+        other = _ensure_tracer(other, self.supervisor)
+        other_expr = self.supervisor.equations[other.idx]
+        self_expr = self.supervisor.equations[self.idx]
+
+        if isinstance(other_expr, Literal) and np.all(other_expr.value == 0.0):
+            return self
+        if isinstance(self_expr, Literal) and np.all(self_expr.value == 0.0):
+            return other
+
         return self._binary_op(other, OpType.ADD)
 
     def __radd__(self, other):
-        return self._binary_op(other, OpType.ADD)
+        return self.__add__(other)
 
     def __mul__(self, other):
+        other = _ensure_tracer(other, self.supervisor)
+        other_expr = self.supervisor.equations[other.idx]
+        self_expr = self.supervisor.equations[self.idx]
+
+        if isinstance(other_expr, Literal):
+            if np.all(other_expr.value == 1.0):
+                return self
+            if np.all(other_expr.value == 0.0):
+                return other
+        if isinstance(self_expr, Literal):
+            if np.all(self_expr.value == 1.0):
+                return other
+            if np.all(self_expr.value == 0.0):
+                return self
+
         return self._binary_op(other, OpType.MUL)
 
     def __rmul__(self, other):
-        return self._binary_op(other, OpType.MUL)
+        return self.__mul__(other)
 
     def __truediv__(self, other):
         return self._binary_op(other, OpType.DIV)
@@ -244,21 +276,63 @@ class Tracer:
         return other._binary_op(self, OpType.DIV)
 
     def __matmul__(self, other):
-        other = _ensure_tracer(other, self.supervisor)
-        self_expr = self.supervisor.equations[self.idx]
-        other_expr = self.supervisor.equations[other.idx]
-
-        if len(self_expr.shape) != 2 or len(other_expr.shape) != 2:
-            raise ValueError("matmul requires 2D arrays")
-        if self_expr.shape[1] != other_expr.shape[0]:
-            raise ValueError(f"Cannot multiply arrays of shapes {self_expr.shape} and {other_expr.shape}")
-        out_shape = (self_expr.shape[0], other_expr.shape[1])
-
-        return Tracer(Op(OpType.MATMUL, [self.idx, other.idx], self_expr.dtype, out_shape), self.supervisor)
+        # Convert matmul to dot_general with appropriate contracting dimensions
+        return self.dot_general(other,
+                              lhs_contracting_dims=(1,),
+                              rhs_contracting_dims=(0,),
+                              lhs_batch_dims=(),
+                              rhs_batch_dims=())
 
     def __rmatmul__(self, other):
         other = _ensure_tracer(other, self.supervisor)
         return other.__matmul__(self)
+
+    def dot_general(self, other,
+                   lhs_contracting_dims: Tuple[int, ...],
+                   rhs_contracting_dims: Tuple[int, ...],
+                   lhs_batch_dims: Tuple[int, ...],
+                   rhs_batch_dims: Tuple[int, ...]) -> 'Tracer':
+        other = _ensure_tracer(other, self.supervisor)
+        self_expr = self.supervisor.equations[self.idx]
+        other_expr = self.supervisor.equations[other.idx]
+
+        # Check contracting dimensions match in length
+        if len(lhs_contracting_dims) != len(rhs_contracting_dims):
+            raise ValueError("Number of lhs and rhs contracting dims must match")
+
+        # Check batch dimensions match in length
+        if len(lhs_batch_dims) != len(rhs_batch_dims):
+            raise ValueError("Number of lhs and rhs batch dims must match")
+
+        # Check contracting dimension sizes match
+        for l, r in zip(lhs_contracting_dims, rhs_contracting_dims):
+            if self_expr.shape[l] != other_expr.shape[r]:
+                raise ValueError(f"Contracting dimension mismatch: {self_expr.shape[l]} != {other_expr.shape[r]}")
+
+        # Check batch dimension sizes match
+        for l, r in zip(lhs_batch_dims, rhs_batch_dims):
+            if self_expr.shape[l] != other_expr.shape[r]:
+                raise ValueError(f"Batch dimension mismatch: {self_expr.shape[l]} != {other_expr.shape[r]}")
+
+        # Calculate output shape:
+        # 1. Start with batch dimensions from lhs
+        out_shape = tuple(self_expr.shape[i] for i in lhs_batch_dims)
+        # 2. Add remaining non-contracting dims from lhs
+        out_shape += tuple(d for i, d in enumerate(self_expr.shape)
+                         if i not in lhs_contracting_dims and i not in lhs_batch_dims)
+        # 3. Add remaining non-contracting dims from rhs
+        out_shape += tuple(d for i, d in enumerate(other_expr.shape)
+                         if i not in rhs_contracting_dims and i not in rhs_batch_dims)
+
+        metadata = {
+            'lhs_contracting_dims': lhs_contracting_dims,
+            'rhs_contracting_dims': rhs_contracting_dims,
+            'lhs_batch_dims': lhs_batch_dims,
+            'rhs_batch_dims': rhs_batch_dims
+        }
+
+        return Tracer(Op(OpType.DOT, [self.idx, other.idx], self_expr.dtype, out_shape, metadata),
+                     self.supervisor)
 
     def __sub__(self, other):
         return self._binary_op(other, OpType.SUB)
@@ -267,6 +341,11 @@ class Tracer:
         return self._binary_op(other, OpType.SUB)
 
     def __pow__(self, other):
+        other = _ensure_tracer(other, self.supervisor)
+        other_expr = self.supervisor.equations[other.idx]
+        # Check for special case x**1 = x
+        if isinstance(other_expr, Literal) and np.all(other_expr.value == 1.0):
+            return self
         return self._binary_op(other, OpType.POW)
 
     def __rpow__(self, other):
@@ -287,13 +366,40 @@ class Tracer:
     def minimum(self, other):
         return self._binary_op(other, OpType.MINIMUM)
 
+    def transpose(self, *axes: int) -> 'Tracer':
+        """Permute dimensions according to axes"""
+        self_expr = self.supervisor.equations[self.idx]
+        if len(axes) == 0:
+            # Default is to reverse dimensions
+            axes = tuple(range(len(self_expr.shape)-1, -1, -1))
+        elif len(axes) != len(self_expr.shape):
+            raise ValueError("axes don't match array dimensions")
+
+        # Check for identity permutation
+        if axes == tuple(range(len(self_expr.shape))):
+            return self
+
+        # Check for duplicate axes
+        if len(set(axes)) != len(axes):
+            raise ValueError("axes contains duplicate values")
+
+        # Check all axes are valid
+        n_dims = len(self_expr.shape)
+        valid_axes = set(range(n_dims))
+        if not set(axes).issubset(valid_axes):
+            raise ValueError(f"axes must be integers in range [0, {n_dims-1}]")
+
+        # Calculate new shape after permutation
+        new_shape = tuple(self_expr.shape[i] for i in axes)
+        metadata = {'axes': axes}
+        return Tracer(Op(OpType.TRANSPOSE, [self.idx], self_expr.dtype, new_shape, metadata), self.supervisor)
+
     @property
     def T(self):
         self_expr = self.supervisor.equations[self.idx]
         if len(self_expr.shape) != 2:
-            raise ValueError("transpose requires 2D array")
-        return Tracer(Op(OpType.TRANSPOSE, [self.idx], self_expr.dtype,
-                        (self_expr.shape[1], self_expr.shape[0])), self.supervisor)
+            raise ValueError("T property requires 2D array")
+        return self.transpose(1, 0)
 
     def sum(self, axis=None, keepdims=False):
         return self._reduction_op(OpType.SUM, axis, keepdims)
@@ -309,6 +415,11 @@ class Tracer:
 
     def _reduction_op(self, op: OpType, axis=None, keepdims=False) -> 'Tracer':
         self_expr = self.supervisor.equations[self.idx]
+
+        # Special case - reduction over empty axes is identity
+        if axis == ():
+            return self
+
         if axis is None:
             axes = tuple(range(len(self_expr.shape)))
         elif isinstance(axis, int):
@@ -401,6 +512,104 @@ def _ensure_tracer(x, supervisor):
     assert type(x) is np.ndarray
     return Tracer(Literal(x), supervisor)
 
+def batch_contract(a, b, lhs_dims, rhs_dims, lhs_batch_dims, rhs_batch_dims):
+    """
+    Perform a batched tensor contraction between tensors a and b.
+
+    Parameters:
+    -----------
+    a : np.ndarray
+        Left tensor
+    b : np.ndarray
+        Right tensor
+    lhs_dims : list[int]
+        Indices of dimensions in a to contract
+    rhs_dims : list[int]
+        Matching indices of dimensions in b to contract
+    lhs_batch_dims : tuple[int]
+        Indices of batch dimensions in left tensor
+    rhs_batch_dims : tuple[int]
+        Indices of batch dimensions in right tensor
+
+    Returns:
+    --------
+    np.ndarray
+        Contracted tensor
+
+    Example:
+    --------
+    # Contract along last dimension:
+    # a: (batch=3, free=5, contract=7)
+    # b: (batch=3, free=2, contract=7)
+    # result: (batch=3, free_a=5, free_b=2)
+    # batch_contract(a, b, lhs_dims=[2], rhs_dims=[2], lhs_batch_dims=[0], rhs_batch_dims=[0])
+    """
+    # Verify contracting dimensions match in size
+    for l, r in zip(lhs_dims, rhs_dims):
+        if a.shape[l] != b.shape[r]:
+            raise ValueError(f"Contracting dimensions must match: "
+                           f"a dim {l} has size {a.shape[l]}, "
+                           f"b dim {r} has size {b.shape[r]}")
+
+    # Verify batch dimensions match in length and size
+    if len(lhs_batch_dims) != len(rhs_batch_dims):
+        raise ValueError("Number of batch dimensions must match")
+
+    for l, r in zip(lhs_batch_dims, rhs_batch_dims):
+        if a.shape[l] != b.shape[r]:
+            raise ValueError(f"Batch dimensions must match: "
+                           f"a dim {l} has size {a.shape[l]}, "
+                           f"b dim {r} has size {b.shape[r]}")
+
+    # Identify dimensions that aren't contracted or batched
+    a_free = tuple(i for i in range(a.ndim)
+              if i not in lhs_dims and
+              i not in lhs_batch_dims)
+    b_free = tuple(i for i in range(b.ndim)
+              if i not in rhs_dims and
+              i not in rhs_batch_dims)
+
+    # Create permutation: [batch_dims, free_dims, contract_dims]
+    a_perm = (tuple(lhs_batch_dims) +
+              a_free +
+              lhs_dims)
+    b_perm = (tuple(rhs_batch_dims) +
+              b_free +
+              rhs_dims)
+
+    a_transposed = np.transpose(a, a_perm)
+    b_transposed = np.transpose(b, b_perm)
+
+    # Get shapes for each part
+    n_batch = len(lhs_batch_dims)
+    n_contract = len(lhs_dims)
+
+    a_shape = a_transposed.shape
+    b_shape = b_transposed.shape
+
+    # Reshape to combine batch dims and free dims
+    a_reshaped = a_transposed.reshape(
+        (-1,) +
+        (np.prod(a_shape[n_batch:-n_contract]),) +
+        (np.prod(a_shape[-n_contract:]),))
+
+    b_reshaped = b_transposed.reshape(
+        (-1,) +
+        (np.prod(b_shape[n_batch:-n_contract]),) +
+        (np.prod(b_shape[-n_contract:]),))
+
+    # Transpose b to get contract dims first for matmul
+    b_reshaped = np.transpose(b_reshaped, (0, 2, 1))
+
+    # Perform batched matrix multiplication
+    result = np.matmul(a_reshaped, b_reshaped)
+
+    # Reshape back to full dimension tensor
+    final_shape = (a_shape[:n_batch] +
+                  a_shape[n_batch:-n_contract] +
+                  b_shape[n_batch:-n_contract])
+    return result.reshape(final_shape)
+
 class Interpreter:
     def __init__(self, inputs: Tuple[pt.Node, ...]):
         self.inputs = inputs
@@ -484,11 +693,28 @@ class Interpreter:
     def visit_op_abs(self, expr: Op) -> Any:
         return np.abs(self.results[expr.inputs[0]])
 
-    def visit_op_matmul(self, expr: Op) -> Any:
-        return self.results[expr.inputs[0]] @ self.results[expr.inputs[1]]
+    def visit_op_dot(self, expr: Op) -> Any:
+        a = self.results[expr.inputs[0]]
+        b = self.results[expr.inputs[1]]
+
+        # Extract dimensions from metadata
+        lhs_c = expr.metadata['lhs_contracting_dims']
+        rhs_c = expr.metadata['rhs_contracting_dims']
+        lhs_b = expr.metadata['lhs_batch_dims']
+        rhs_b = expr.metadata['rhs_batch_dims']
+
+        # Default numpy matmul: contract last dim of a with first dim of b
+        if not lhs_c and not rhs_c and not lhs_b and not rhs_b:
+            return a @ b
+
+        # Full dot general using batch_contract
+        return batch_contract(a, b, lhs_c, rhs_c, lhs_batch_dims=lhs_b, rhs_batch_dims=rhs_b)
 
     def visit_op_transpose(self, expr: Op) -> Any:
-        return self.results[expr.inputs[0]].T
+        axes = expr.metadata.get('axes')
+        if axes:
+            return np.transpose(self.results[expr.inputs[0]], axes)
+        return np.transpose(self.results[expr.inputs[0]])
 
     def visit_op_reshape(self, expr: Op) -> Any:
         return np.reshape(self.results[expr.inputs[0]], expr.shape)
@@ -538,16 +764,18 @@ class ArgSpec:
 
 class Transform:
     """Base class for function transformations like jit and grad"""
-    def __init__(self, fn, transforms=()):
+    def __init__(self, fn, *, transforms=(), static_argnames=None):
         # If fn is already a Transform, compose the transforms
         if isinstance(fn, Transform):
             self.fn = fn.fn
             self.signature = fn.signature
             self.transforms = fn.transforms + transforms
+            self.static_argnames = fn.static_argnames | (static_argnames or set())
         else:
             self.fn = fn
             self.signature = inspect.signature(fn)
             self.transforms = transforms
+            self.static_fields = static_argnames or set()
         self.expr_cache = {}
 
     @staticmethod
@@ -586,15 +814,15 @@ class Transform:
             pt.map(assign_value, value_tree, index_tree)
         return tuple(values)
 
-    def get_expr(self, *arg_specs):
+    def get_expr(self, *arg_specs, pred=lambda _, __: True):
         """Get expression graph for function given input specs"""
         # Create key from arg_specs for caching
-        frozen_specs = pt.freeze(pt.from_sequence(arg_specs).to_value())
+        frozen_specs = pt.freeze(arg_specs)
         if frozen_specs in self.expr_cache:
             return self.expr_cache[frozen_specs]
 
         supervisor = TracerSupervisor()
-        full_tree = pt.from_sequence(arg_specs)
+        full_tree = pt.from_sequence(arg_specs, pred=pred)
         index_tree, = self.index_pytrees(full_tree)
         def make_var(arg_spec, arg_index):
             return Tracer(Var(arg_index, arg_spec.dtype, arg_spec.shape), supervisor)
@@ -607,6 +835,7 @@ class Transform:
         else:
             pytree = pt.from_value(result)
             pytree = pt.map(lambda x: x.idx, pytree)
+            assert isinstance(pytree, pt.Node)
             lambda_expr = supervisor.create_lambda(index_tuple, pytree)
 
         # Cache and return the result
@@ -618,29 +847,35 @@ class Transform:
         bound_args.apply_defaults()
         arg_trees = []
         arg_specs = []
-        for arg in bound_args.arguments.values():
-            node = pt.from_value(arg)
-            spec = ArgSpec.from_pytree(node)
-            arg_trees.append(node)
-            arg_specs.append(spec)
-        lambda_expr = self.get_expr(*arg_specs)
+        arg_masks = []
+        for name, arg in bound_args.arguments.items():
+            is_static = name in self.static_fields
+            arg_masks.append(not is_static)
+            if is_static:
+                arg_specs.append(arg)
+            else:
+                node = pt.from_value(arg)
+                spec = ArgSpec.from_pytree(node)
+                arg_trees.append(node)
+                arg_specs.append(spec)
+        lambda_expr = self.get_expr(*arg_specs, pred=lambda i, _: arg_masks[i])
         for transform in self.transforms:
             lambda_expr = transform(lambda_expr)
         return Interpreter(tuple(arg_trees))(lambda_expr)
 
 class grad(Transform):
-    def __init__(self, fn):
+    def __init__(self, fn, *, static_argnames=None, wrt=None):
         super().__init__(fn, transforms=(
-            Gradient(),
+            Gradient(wrt_args=wrt),
             CommonSubexpressionElimination(),
             ConstantFolding(),
-            AlgebraicSimplification(),
+            # AlgebraicSimplification(),
             DeadCodeElimination()
-        ))
+        ), static_argnames=static_argnames)
 
 class jit(Transform):
-    def __init__(self, fn):
-        super().__init__(fn)
+    def __init__(self, fn, *, static_argnames=None):
+        super().__init__(fn, static_argnames=static_argnames)
 
 class Gradient:
     def __init__(self, gradient_only=True, wrt_args=None):
@@ -650,36 +885,31 @@ class Gradient:
         self.gradient_only = gradient_only
         self.wrt_args = wrt_args
 
-    # TODO: Update this for jacobians
     def _handle_broadcast_derivative(self, input_idx: int, input_shape: Tuple[int, ...],
                                    output_shape: Tuple[int, ...], derivative: Tracer) -> None:
         """Handle summing over broadcasted dimensions for elementwise operations"""
-        # Sum over dimensions that were broadcast for input
+        # Get number of leading dimensions from derivative shape if in jacobian case
+        n_leading = len(derivative.shape) - len(output_shape)
+
+        # Build list of axes to sum over
         sum_axes = []
-        len_diff = len(output_shape) - len(input_shape)
 
-        # Handle case where output has more dimensions than input
-        if len_diff > 0:
-            sum_axes.extend(range(len_diff))
-            # Pad input shape with 1's to match output length
-            padded_input_shape = (1,) * len_diff + input_shape
-            # Check remaining dimensions
-            sum_axes.extend(i+len_diff for i, (s1, s2) in
-                          enumerate(zip(padded_input_shape, output_shape[len_diff:]))
-                          if s1 == 1 and s2 > 1)
-        else:
-            # Just check aligned dimensions when shapes same length
-            sum_axes.extend(i for i, (s1, s2) in enumerate(zip(input_shape, output_shape))
-                          if s1 == 1 and s2 > 1)
+        # Check dimensions that were broadcast from 1 to match output
+        for i, (s1, s2) in enumerate(zip(input_shape, output_shape[-len(input_shape):])):
+            if s1 == 1 and s2 > 1:
+                sum_axes.append(i + n_leading)
 
-        if sum_axes:
-            # Keep dims always then reshape at end
-            result = derivative.sum(tuple(sum_axes), keepdims=True)
-            result = result.reshape(*input_shape)
-            self.derivatives[input_idx] += result
-        else:
-            result = derivative.reshape(*input_shape)
-            self.derivatives[input_idx] += result
+        # Add remaining dimensions that had to be padded with 1s
+        for i in range(len(input_shape), len(output_shape)):
+            sum_axes.append(i + n_leading)
+
+        # Sum over broadcast dimensions if any
+        result = derivative.sum(tuple(sum_axes), keepdims=True) if sum_axes else derivative
+
+        # Reshape to match input shape while preserving leading dimensions
+        new_shape = derivative.shape[:n_leading] + input_shape
+        result = result.reshape(*new_shape)
+        self.derivatives[input_idx] += result
 
     def visit_literal(self, eq: Literal, derivative: Tracer) -> None:
         # Always 0, nothing upstream of it
@@ -754,32 +984,99 @@ class Gradient:
         self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
         self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
 
-    # TODO: Update this for jacobians
-    def visit_matmul(self, eq: Op, derivative: Tracer) -> None:
+    def visit_dot(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self.derivatives[eq.inputs[0]] += derivative @ b.T
-        self.derivatives[eq.inputs[1]] += a.T @ derivative
 
-    # TODO: Update this for jacobians and generally just things
-    #       that are not 2-tensors...will require updating transpose
+        # Extract dimensions from metadata
+        lhs_c = eq.metadata['lhs_contracting_dims']
+        rhs_c = eq.metadata['rhs_contracting_dims']
+        lhs_b = eq.metadata['lhs_batch_dims']
+        rhs_b = eq.metadata['rhs_batch_dims']
+
+        # For jacobian case, need to preserve leading dimensions from derivative
+        if len(derivative.shape) > len(eq.shape):
+            leading_dims = derivative.shape[:-len(eq.shape)]
+        else:
+            leading_dims = ()
+
+        # Handle derivative wrt first arg (a)
+        # Need to contract derivative with b in appropriate dimensions
+        # C_ji = sum(k, A_ki * B_kj)
+        # dL/d_Aki = sum(j, dL/dC_ji * dC_ji/d_Aki)
+        # dC_ji/d_Aki = B_kj (zero everywhere else)
+        # dL/d_Aki = sum(j, dL/dC_ji * B_kj) # contract shared non-contracting dims
+        # dL/d_Bkj = sum(i, dL/dC_ji * dC_ji/d_Bkj)
+        # dC_ji/d_Bkj = A_ki (zero elsewhere)
+        # dL/d_Bkj = sum(i, dL/dC_ji * A_ki) # contract shared non-contracting dims
+
+        # For derivative wrt a:
+        # Need to match derivative dims [*leading, *batch, *a_free, *b_free] with b's dims [*batch, *b_free, *contract]
+        # to get result dims [*leading, *batch, *a_free, *contract]
+        b_free_dims = [i for i in range(len(b.shape)) if i not in rhs_c and i not in rhs_b]
+        a_free_dims = [i for i in range(len(a.shape)) if i not in lhs_c and i not in lhs_b]
+        derivative_b_free_offset = len(leading_dims) + len(lhs_b) + len(a_free_dims)
+        da = derivative.dot_general(b,
+            lhs_contracting_dims=tuple(range(derivative_b_free_offset, derivative_b_free_offset + len(b_free_dims))),
+            rhs_contracting_dims=tuple(b_free_dims),
+            lhs_batch_dims=tuple(range(len(leading_dims), len(leading_dims) + len(lhs_b))),
+            rhs_batch_dims=rhs_b)
+        assert da.shape == leading_dims + a.shape
+        self.derivatives[eq.inputs[0]] += da
+
+        # Handle derivative wrt second arg (b)
+        # Need to match derivative dims [*leading, *batch, *a_free, *b_free] with a's dims [*batch, *a_free, *contract]
+        # to get result dims [*leading, *batch, *b_free, *contract]
+        derivative_a_free_offset = len(leading_dims) + len(lhs_b) + len(b_free_dims)
+        db = derivative.dot_general(a,
+            lhs_contracting_dims=tuple(range(len(leading_dims) + len(lhs_b), derivative_a_free_offset)),
+            rhs_contracting_dims=tuple(a_free_dims),
+            lhs_batch_dims=tuple(range(len(leading_dims), len(leading_dims) + len(lhs_b))),
+            rhs_batch_dims=lhs_b)
+        assert db.shape == leading_dims + b.shape
+        self.derivatives[eq.inputs[1]] += db
+
+
     def visit_transpose(self, eq: Op, derivative: Tracer) -> None:
-        self.derivatives[eq.inputs[0]] += derivative.T
+        axes = eq.metadata['axes']
+        # Compute inverse permutation
+        inverse_axes = [0] * len(axes)
+        for i, axis in enumerate(axes):
+            inverse_axes[axis] = i
+        # For Jacobian case, preserve leading dims and append inverse permutation
+        if len(derivative.shape) > len(eq.shape):
+            leading_dims = derivative.shape[:-len(eq.shape)]
+            inverse_axes = tuple(range(len(leading_dims))) + tuple(i + len(leading_dims) for i in inverse_axes)
+        self.derivatives[eq.inputs[0]] += derivative.transpose(*inverse_axes)
 
-    # TODO: Update this for jacobians, will only require reshaping
-    #       the input dims
+
     def visit_reshape(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self.derivatives[eq.inputs[0]] += derivative.reshape(*input_val.shape)
+        if len(derivative.shape) > len(eq.shape):
+            # Jacobian case - preserve leading dims and reshape output dims
+            leading_dims = derivative.shape[:-len(eq.shape)]
+            new_shape = leading_dims + input_val.shape
+            self.derivatives[eq.inputs[0]] += derivative.reshape(*new_shape)
+        else:
+            # Gradient case - just reshape to match input
+            self.derivatives[eq.inputs[0]] += derivative.reshape(*input_val.shape)
 
     def visit_broadcast(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
         self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative)
 
-    # TODO: gotta get the shape right here
     def visit_sum(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        output_shape = input_val.supervisor.equations[input_val.idx].shape
-        self.derivatives[eq.inputs[0]] += derivative.broadcast_to(output_shape)
+        input_eq = input_val.supervisor.equations[input_val.idx]
+        output_shape = input_eq.shape
+
+        # For jacobian case, we need to preserve leading dims from derivative
+        # and append original input shape for broadcasting
+        if len(derivative.shape) > len(eq.shape):
+            broadcast_shape = derivative.shape[:-len(eq.shape)] + output_shape
+        else:
+            broadcast_shape = output_shape
+
+        self.derivatives[eq.inputs[0]] += derivative.broadcast_to(broadcast_shape)
 
     def visit_prod(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
@@ -812,7 +1109,7 @@ class Gradient:
 
         # Get result node(s)
         results = []
-        pt.map(lambda node: results.append(node.leaf_value), lambda_expr.result)
+        pt.map(lambda idx: results.append(idx), lambda_expr.result)
 
         # Copy over original equations
         self.equation_map = [Tracer(eq, self.supervisor) for eq in lambda_expr.equations]
@@ -830,7 +1127,13 @@ class Gradient:
             self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
 
             # Initialize derivative of result wrt result as 1.0
-            self.derivatives[result_idx] = _ensure_tracer(1.0, self.supervisor)
+            if self.gradient_only:
+                self.derivatives[result_idx] = _ensure_tracer(1.0, self.supervisor)
+            else:
+                # Create identity jacobian mapping from result shape to result shape
+                result_eq = lambda_expr.equations[result_idx]
+                identity = np.eye(np.prod(result_eq.shape)).reshape(result_eq.shape + result_eq.shape)
+                self.derivatives[result_idx] = _ensure_tracer(identity, self.supervisor)
 
             # Work backwards through equations propagating derivatives
             for i in range(len(lambda_expr.equations)-1, -1, -1):
@@ -867,7 +1170,9 @@ class Gradient:
             def make_jacobian_node(out_node):
                 output_idx = results.index(out_node.leaf_value)
                 return all_derivatives[output_idx]
+            assert isinstance(lambda_expr.result, pt.Node)
             result = pt.map(make_jacobian_node, lambda_expr.result)
+            assert isinstance(result, pt.Node)
 
         return self.supervisor.create_lambda(lambda_expr.args, result)
 
@@ -933,8 +1238,9 @@ class DeadCodeElimination:
         # Update result indices
         def update_index(idx: int) -> int:
             return old_to_new.get(idx, idx)
+        assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
-
+        assert isinstance(new_result, pt.Node)
         return Lambda(lambda_expr.args, new_equations, new_result)
 
 class CommonSubexpressionElimination:
@@ -977,8 +1283,9 @@ class CommonSubexpressionElimination:
         # Update result indices
         def update_index(idx: int) -> int:
             return old_to_new[idx]
+        assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
-
+        assert isinstance(new_result, pt.Node)
         return Lambda(lambda_expr.args, new_equations, new_result)
 
 class ConstantFolding:
@@ -1040,7 +1347,9 @@ class ConstantFolding:
         # Update result indices
         def update_index(idx: int) -> int:
             return old_to_new[idx]
+        assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
+        assert isinstance(new_result, pt.Node)
 
         return Lambda(lambda_expr.args, new_equations, new_result)
 
@@ -1072,6 +1381,7 @@ class AlgebraicSimplification:
         self.new_equations = []
         self.old_to_new = {}
 
+        assert isinstance(lambda_expr.result, pt.Node)
         for i, eq in enumerate(lambda_expr.equations):
             if not self.can_simplify(eq):
                 # Keep equation as-is, just update input indices for Ops
@@ -1089,6 +1399,7 @@ class AlgebraicSimplification:
         def update_index(idx: int) -> int:
             return self.old_to_new[idx]
         new_result = pt.map(update_index, lambda_expr.result)
+        assert isinstance(new_result, pt.Node)
 
         return Lambda(lambda_expr.args, self.new_equations, new_result)
 

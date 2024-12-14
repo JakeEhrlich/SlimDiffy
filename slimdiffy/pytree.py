@@ -8,8 +8,9 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, Union
 
-def static_field(value: Any) -> Any:
-    return dataclasses.field(default=value, metadata={'static_field': True})
+def static_field(**kwargs) -> Any:
+    metadata = kwargs.pop("metadata") if "metadata" in kwargs else {}
+    return dataclasses.field(metadata={**metadata, 'static_field': True}, **kwargs)
 
 def leaf(value: Any) -> 'Node':
     """Creates a Node leaf containing the given value"""
@@ -20,13 +21,27 @@ def from_dict(d: Dict[str, Any]) -> 'Node':
     return Node(dict, {k: leaf(v) if not isinstance(v, Node) else v
                             for k,v in d.items()}, {})
 
-def from_sequence(s: Union[List, Tuple]) -> 'Node':
-    """Creates a Node from a list or tuple"""
-    return Node(type(s), {i: leaf(v) if not isinstance(v, Node) else v
-                               for i,v in enumerate(s)}, {})
+def from_sequence(s: Union[List, Tuple], pred: Callable[[int, Any], bool] = lambda i, v: True) -> 'Node':
+    """Creates a Node from a list or tuple.
+
+    Args:
+        s: The sequence to create a Node from
+        pred: A function taking (index, value) and returning True if item should be in fields
+              or False if it should go in metadata
+    """
+    fields = {}
+    metadata = {}
+    for i, v in enumerate(s):
+        if pred(i, v):
+            fields[i] = leaf(v) if not isinstance(v, Node) else v
+        else:
+            metadata[i] = v
+    return Node(type(s), fields, metadata)
 
 def mapkeys(f: Callable[..., Any], *trees: 'Node', path: Tuple[Union[str, int], ...] = ()) -> 'Node':
     """Maps a function over multiple Nodes, applying f to corresponding leaves"""
+    assert all(isinstance(tree, Node) for tree in trees)
+
     leaf_values = [tree.leaf_value is not None for tree in trees]
     if any(leaf_values) and not all(leaf_values):
         raise ValueError("Trees must have leaves in same positions")
@@ -57,7 +72,7 @@ def map(f: Callable[..., Any], *trees: 'Node') -> 'Node':
 @dataclass
 class Node:
     """Represents a node in a pytree structure"""
-    typ: type
+    typ: type = static_field()
     fields: dict[Union[str, int], 'Node']
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     leaf_value: Any = None
@@ -70,10 +85,13 @@ class Node:
         """Converts a Nodes for a sequence into a sequence of Nodes"""
         if self.leaf_value is not None:
             return self.leaf_value
-        result: list[Any] = [None] * len(self.fields)
+        result: list[Any] = [None] * (len(self.fields) + len(self.metadata))
         for i, v in self.fields.items():
             assert isinstance(i, int), f"Sequence index must be integer, got {type(i)}"
             result[i] = v
+        for i, v in self.metadata.items():
+            if isinstance(i, int):
+                result[i] = v
         assert None not in result, "Sequence cannot contain None values"
         return tuple(result) if self.typ is tuple else result
 
@@ -111,10 +129,13 @@ class Node:
             return self.leaf_value
 
         if self.typ in (list, tuple):
-            result: list[Any] = [None] * len(self.fields)
+            result: list[Any] = [None] * (len(self.fields) + len(self.metadata))
             for i, v in self.fields.items():
                 assert type(i) is int
                 result[i] = v.to_value()
+            for i, v in self.metadata.items():
+                if isinstance(i, int):
+                    result[i] = v
             return tuple(result) if self.typ is tuple else result
 
         elif self.typ is dict:
@@ -151,7 +172,7 @@ def from_value(x: Any) -> Node:
 
 def freeze(x: Any) -> Any:
     """Converts a value into an immutable form suitable for dictionary keys"""
-    if isinstance(x, (str, int, float, bool, complex, bytes, type(None), np.dtype)):
+    if isinstance(x, (str, int, float, bool, complex, bytes, type(None), np.dtype, type)):
         return x
     elif isinstance(x, (list, tuple)):
         return tuple(freeze(v) for v in x)
