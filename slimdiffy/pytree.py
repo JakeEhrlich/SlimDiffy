@@ -146,6 +146,9 @@ class Node:
             args.update(self.metadata) # type: ignore
             return self.typ(**args) # type: ignore
 
+        elif self.typ is type(None):
+            return None
+
         else:
             raise ValueError(f"Cannot convert Node with type {self.typ} to value")
 

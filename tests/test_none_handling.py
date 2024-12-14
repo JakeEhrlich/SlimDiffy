@@ -30,7 +30,17 @@ def test_none_in_dict():
     except Exception as e:
         print(f'Error: {e}')
 
+def test_none_type_node():
+    """Test Node with NoneType as typ"""
+    try:
+        node = pt.Node(type(None), {}, {})
+        value = node.to_value()
+        print(f'Success: Node with NoneType typ converted to {value}')
+    except Exception as e:
+        print(f'Error: {e}')
+
 if __name__ == '__main__':
     test_none_leaf()
     test_none_in_sequence()
     test_none_in_dict()
+    test_none_type_node()
