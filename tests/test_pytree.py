@@ -75,7 +75,8 @@ def test_from_dict_to_value(dict):
 
 @given(st.dictionaries(st.text(min_size=1), make_node_strategy(2)))
 def test_from_dict_to_value2(dict):
-    assert pt.from_dict(dict).to_value() == dict
+    expected = {k: v.to_value() for k, v in dict.items()}
+    assert pt.from_dict(dict).to_value() == expected
 
 @given(st.lists(make_pytree_strategy(2)), st.lists(st.booleans()))
 def test_from_sequence_to_value(lst, mask):
@@ -87,7 +88,8 @@ def test_from_sequence_to_value(lst, mask):
 def test_from_sequence_to_value2(lst, mask):
     # Extend mask if needed
     mask = mask + [False] * (len(lst) - len(mask))
-    assert pt.from_sequence(lst, lambda i, _: mask[i]).to_value() == lst
+    expected = [v if not mask[i] else v.to_value() for i, v in enumerate(lst)]
+    assert pt.from_sequence(lst, lambda i, _: mask[i]).to_value() == expected
 
 @given(make_node_strategy(3))
 def test_map_identity(tree):
@@ -157,7 +159,7 @@ def test_sequence_roundtrip(lst):
     # Create a sequence of nodes and convert to value
     node = pt.from_sequence(lst)
     sequence = node.to_sequence()
-    assert sequence == tuple(lst)
+    assert sequence == lst
 
 def traverse_frozen_tree(tree, frozen_tree):
     if isinstance(tree, (int, float, str, bool, type(None), type)):
