@@ -31,7 +31,7 @@ def elementwise_strategy(k: int):
                 elements=st.floats(
                     allow_infinity=False,
                     allow_nan=False,
-                    min_value=0.1,  # Ensure positive values for log and non-zero for div
+                    min_value=-10.0,  # Restore original value
                     max_value=10.0
                 )
             ))
@@ -276,14 +276,48 @@ def non_zero_float_strategy(min_value=-10.0, max_value=10.0, epsilon=1e-3):
             min_value=min_value,
             max_value=max_value
         ))
-        return x + (epsilon if x >= 0 else -epsilon)
+        # Ensure minimum absolute value while preserving sign
+        return x + (epsilon if x >= 0 else -epsilon) if abs(x) < epsilon else x
+    return strategy()
+
+def positive_float_strategy(min_value=0.1, max_value=10.0, epsilon=1e-3):
+    @st.composite
+    def strategy(draw):
+        x = draw(st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=min_value,
+            max_value=max_value
+        ))
+        return max(x, epsilon)  # Ensure value is at least epsilon
     return strategy()
 
 def broadcasted_elementwise_strategy(k: int, values=None):
+    """Generate k-ary broadcasting strategy with configurable value ranges.
+
+    Args:
+        k: Number of input tensors
+        values: Either a single strategy or list of k strategies for tensor values.
+               If None, uses default range [-10, 10].
+    """
     @st.composite
     def build_tensors(draw):
-        base = st.shared(shape_strategy())
+        # Default strategy if none provided
+        if values is None:
+            default_values = st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+            tensor_values = [default_values] * k
+        elif isinstance(values, list):
+            assert len(values) == k, f"Expected {k} strategies, got {len(values)}"
+            tensor_values = values
+        else:
+            tensor_values = [values] * k
 
+        base = st.shared(shape_strategy())
         shape = draw(base)
         num_dims = len(shape)
 
@@ -297,7 +331,7 @@ def broadcasted_elementwise_strategy(k: int, values=None):
                 lambda col: not all(col)
             )
         allow_changes = [draw(valid_col()) for _ in range(num_dims)]
-        allow_changes = list(zip(*allow_changes)) # Transpose to per-tensor masks
+        allow_changes = list(zip(*allow_changes))  # Transpose to per-tensor masks
 
         # Pick one tensor to maintain dimension count
         fixed_dims_idx = draw(st.integers(min_value=0, max_value=k-1))
@@ -330,13 +364,13 @@ def broadcasted_elementwise_strategy(k: int, values=None):
                 arrays(
                     np.dtype('float64'),
                     shape=tuple(tensor_shape),
-                    elements=values[i] if isinstance(values, list) else values
+                    elements=tensor_values[i]
                 )
             ))
 
         return tuple(tensors)
 
-    return build_tensors() #type: ignore
+    return build_tensors()  #type: ignore
 
 def generate_broadcast_shape_strategy(base_shape):
     def make_broadcast_shape():
@@ -823,8 +857,8 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_mul, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2, values=[
         st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
-        non_zero_float_strategy()
-    ])),  # Safe range for division
+        non_zero_float_strategy(min_value=-10.0, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_dot, matmul_strategy()),
@@ -832,8 +866,8 @@ basic_tensor_tests = [
     #TestFunc(tensor_courpus_transpose, transpose_strategy()),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1, values=
-        st.floats(allow_infinity=False, allow_nan=False, min_value=0.1, max_value=10.0)
-    )),  # Safe range for logarithm
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    )),
     TestFunc(tensor_courpus_sin, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_abs, broadcasted_elementwise_strategy(1)),
