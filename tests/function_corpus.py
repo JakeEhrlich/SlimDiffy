@@ -16,24 +16,34 @@ def shape_strategy():
     sizes = st.integers(min_value=1, max_value=5)
     return st.lists(sizes, min_size=0, max_size=4).map(tuple)
 
-def elementwise_strategy(k: int):
+def elementwise_strategy(k: int, values=None):
     # Generate shared shape and arrays with same shape
     base = st.shared(shape_strategy())
 
     @st.composite
     def generate_tensors(draw):
+        # Default strategy if none provided
+        if values is None:
+            default_values = st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+            tensor_values = [default_values] * k
+        elif isinstance(values, list):
+            assert len(values) == k, f"Expected {k} strategies, got {len(values)}"
+            tensor_values = values
+        else:
+            tensor_values = [values] * k
+
         shape = draw(base)
         tensors = []
-        for _ in range(k):
+        for i in range(k):
             tensor = draw(arrays(
                 np.dtype('float64'),
                 shape=shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,  # Restore original value
-                    max_value=10.0
-                )
+                elements=tensor_values[i]
             ))
             tensors.append(tensor)
         return tuple(tensors)
@@ -277,20 +287,16 @@ def non_zero_float_strategy(min_value=-10.0, max_value=10.0, epsilon=1e-3):
             max_value=max_value
         ))
         # Ensure minimum absolute value while preserving sign
-        return x + (epsilon if x >= 0 else -epsilon) if abs(x) < epsilon else x
+        return x + epsilon if x >= 0 else -epsilon
     return strategy()
 
-def positive_float_strategy(min_value=0.1, max_value=10.0, epsilon=1e-3):
-    @st.composite
-    def strategy(draw):
-        x = draw(st.floats(
-            allow_infinity=False,
-            allow_nan=False,
-            min_value=min_value,
-            max_value=max_value
-        ))
-        return max(x, epsilon)  # Ensure value is at least epsilon
-    return strategy()
+def positive_float_strategy(min_value=0.1, max_value=10.0):
+    return st.floats(
+        allow_infinity=False,
+        allow_nan=False,
+        min_value=min_value,
+        max_value=max_value
+    )
 
 def broadcasted_elementwise_strategy(k: int, values=None):
     """Generate k-ary broadcasting strategy with configurable value ranges.
@@ -323,7 +329,7 @@ def broadcasted_elementwise_strategy(k: int, values=None):
 
         # Return empty tensors if no dimensions
         if num_dims == 0:
-            return draw(elementwise_strategy(k))
+            return draw(elementwise_strategy(k, values))
 
         # Generate valid "allow change" matrix - at least one unchanged dim per column
         def valid_col():
@@ -866,7 +872,7 @@ basic_tensor_tests = [
     #TestFunc(tensor_courpus_transpose, transpose_strategy()),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1, values=
-        positive_float_strategy(min_value=0.1, max_value=10.0)
+         positive_float_strategy(min_value=0.1, max_value=10.0)
     )),
     TestFunc(tensor_courpus_sin, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos, broadcasted_elementwise_strategy(1)),

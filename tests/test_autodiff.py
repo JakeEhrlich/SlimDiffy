@@ -2,9 +2,7 @@ import hypothesis
 #import hypothesis.strategies as st
 import numpy as np
 import slimdiffy.autodiff as ad
-from function_corpus import TestFunc, tensor_courpus_add_mul, broadcasted_elementwise_strategy, get_test_samples, all_pairs_tests, dog_elementwise_tests, basic_tensor_tests
-
-basic_test = [TestFunc(tensor_courpus_add_mul, broadcasted_elementwise_strategy(2))]
+from function_corpus import get_test_samples, basic_tensor_tests
 
 @hypothesis.given(get_test_samples(basic_tensor_tests))
 def test_functions(test_obj):
