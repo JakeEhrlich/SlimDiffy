@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import dataclasses
 from typing import Any, Callable
 import slimdiffy.autodiff as ad
 import hypothesis.strategies as st
@@ -9,7 +10,7 @@ from hypothesis.extra.numpy import arrays
 class TestFunc:
     function: Callable
     arg_strategy: Any
-
+    static_argnames: frozenset = dataclasses.field(default_factory=lambda: frozenset())
 
 def shape_strategy():
     # Generate reasonable dimensions for tensor shapes
@@ -709,10 +710,10 @@ def tensor_courpus_min(x):
     return ad.min(x)
 
 def tensor_courpus_reshape(x, shape):
-    return x.reshape(shape)
+    return ad.reshape(x, shape)
 
 def tensor_courpus_broadcast(x, shape):
-    return x.broadcast_to(shape)
+    return ad.broadcast_to(x, shape)
 
 def tensor_courpus_add_mul(x, y):
     return (x + y) * (x + y)
@@ -868,8 +869,8 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_dot, matmul_strategy()),
-    #TestFunc(tensor_courpus_dot_general, dog_general_strategy()),
-    #TestFunc(tensor_courpus_transpose, transpose_strategy()),
+    #TestFunc(tensor_courpus_dot_general, dog_general_strategy(), static_argnames={'lhs_contracting_dims', 'rhs_contracting_dims', 'lhs_batch_dims', 'rhs_batch_dims'}),
+    TestFunc(tensor_courpus_transpose, transpose_strategy(), static_argnames={'axes'}),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1, values=
          positive_float_strategy(min_value=0.1, max_value=10.0)
@@ -880,8 +881,8 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_sum, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_max, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_min, broadcasted_elementwise_strategy(1)),
-    #TestFunc(tensor_courpus_reshape, reshape_strategy()),
-    #TestFunc(tensor_courpus_broadcast, broadcast_strategy()),
+    #TestFunc(tensor_courpus_reshape, reshape_strategy(), static_argnames={'shape'}),
+    #TestFunc(tensor_courpus_broadcast, broadcast_strategy(), static_argnames={'shape'}),
 ]
 
 def get_test_samples(test_set):
@@ -895,6 +896,6 @@ def get_test_samples(test_set):
         args = draw(test_func.arg_strategy)
 
         # Return tuple of (function, args)
-        return (test_func.function, args)
+        return (test_func.function, args, test_func.static_argnames)
 
     return test_sample_strategy()

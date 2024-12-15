@@ -448,6 +448,21 @@ def io_callback(x, fn):
                         metadata={'callback': fn}), x.supervisor)
     return fn(x)
 
+def reshape(x, *shape):
+    if isinstance(x, Tracer):
+        return x.reshape(*shape)
+    return np.reshape(x, shape)
+
+def transpose(x, *axes):
+    if isinstance(x, Tracer):
+        return x.transpose(*axes)
+    return np.transpose(x, axes)
+
+def broadcast_to(x, shape):
+    if isinstance(x, Tracer):
+        return x.broadcast_to(shape)
+    return np.broadcast_to(x, shape)
+
 def minimum(x, other):
     if isinstance(x, Tracer):
         return x.minimum(other)
