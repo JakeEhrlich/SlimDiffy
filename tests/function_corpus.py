@@ -817,7 +817,7 @@ basic_tensor_tests = [
     #TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
-    #TestFunc(tensor_courpus_dot, matmul_strategy()),
+    TestFunc(tensor_courpus_dot, matmul_strategy()),
     #TestFunc(tensor_courpus_dot_general, dog_general_strategy()),
     #TestFunc(tensor_courpus_transpose, transpose_strategy()),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
