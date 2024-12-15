@@ -81,17 +81,19 @@ class Node:
         if bool(self.fields) and self.leaf_value is not None:
             raise ValueError("Nodes cannot have both fields and a leaf value")
 
-    def to_sequence(self) -> Union[List, Tuple]:
+    def to_sequence(self, include_metadata: bool = True) -> Union[List, Tuple]:
         """Converts a Nodes for a sequence into a sequence of Nodes"""
         if self.leaf_value is not None:
             return self.leaf_value
-        result: list[Any] = [None] * (len(self.fields) + len(self.metadata))
+        length = len(self.fields) + (len(self.metadata) if include_metadata else 0)
+        result: list[Any] = [None] * length
         for i, v in self.fields.items():
             assert isinstance(i, int), f"Sequence index must be integer, got {type(i)}"
             result[i] = v
-        for i, v in self.metadata.items():
-            if isinstance(i, int):
-                result[i] = v
+        if include_metadata:
+            for i, v in self.metadata.items():
+                if isinstance(i, int):
+                    result[i] = v
         assert None not in result, "Sequence cannot contain None values"
         return tuple(result) if self.typ is tuple else result
 
@@ -173,10 +175,27 @@ def from_value(x: Any) -> Node:
     else:
         return leaf(x)
 
+@dataclass
+class HashableArray:
+    data: list
+    shape: tuple
+    dtype: np.dtype
+
+    @staticmethod
+    def from_array(arr: np.ndarray) -> 'HashableArray':
+        """Converts a numpy array into a hashable array"""
+        return HashableArray(data=arr.flatten().tolist(), shape=arr.shape, dtype=arr.dtype)
+
+    def to_array(self) -> np.ndarray:
+        """Converts the hashable array back into a numpy array"""
+        return np.array(self.data, dtype=self.dtype).reshape(self.shape)
+
 def freeze(x: Any) -> Any:
     """Converts a value into an immutable form suitable for dictionary keys"""
     if isinstance(x, (str, int, float, bool, complex, bytes, type(None), np.dtype, type)):
         return x
+    elif isinstance(x, np.ndarray):
+        return freeze(HashableArray.from_array(x))
     elif isinstance(x, (list, tuple)):
         return tuple(freeze(v) for v in x)
     elif isinstance(x, dict):

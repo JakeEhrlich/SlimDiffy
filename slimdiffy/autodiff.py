@@ -512,6 +512,51 @@ def _ensure_tracer(x, supervisor):
     assert type(x) is np.ndarray
     return Tracer(Literal(x), supervisor)
 
+def batch_contract_einsum(a, b, lhs_dims, rhs_dims, lhs_batch_dims, rhs_batch_dims):
+    """
+    Perform a batched tensor contraction between tensors a and b using einsum.
+
+    Like batch_contract but using einsum notation instead of explicit reshape/transpose.
+    """
+    # Get non-contract, non-batch dims
+    lhs_free = [i for i in range(len(a.shape)) if i not in lhs_dims and i not in lhs_batch_dims]
+    rhs_free = [i for i in range(len(b.shape)) if i not in rhs_dims and i not in rhs_batch_dims]
+
+    # Build dimension labels using ASCII lowercase letters
+    dim_labels = iter('ijklmnopqrstuvwxyzabcdefgh')
+
+    # Assign labels to each dimension type
+    batch_labels = [next(dim_labels) for _ in lhs_batch_dims]
+    lhs_free_labels = [next(dim_labels) for _ in lhs_free]
+    rhs_free_labels = [next(dim_labels) for _ in rhs_free]
+    contract_labels = [next(dim_labels) for _ in lhs_dims]
+
+    # Build lhs subscript by assigning labels to the right dims
+    lhs_labels = ["!"] * len(a.shape)
+    for i, label in zip(lhs_batch_dims, batch_labels):
+        lhs_labels[i] = label
+    for i, label in zip(lhs_free, lhs_free_labels):
+        lhs_labels[i] = label
+    for i, label in zip(lhs_dims, contract_labels):
+        lhs_labels[i] = label
+
+    # Build rhs subscript similarly
+    rhs_labels = ["!"] * len(b.shape)
+    for i, label in zip(rhs_batch_dims, batch_labels):
+        rhs_labels[i] = label
+    for i, label in zip(rhs_free, rhs_free_labels):
+        rhs_labels[i] = label
+    for i, label in zip(rhs_dims, contract_labels):
+        rhs_labels[i] = label
+
+    # Build output subscript from batch + free dims
+    out_labels = batch_labels + lhs_free_labels + rhs_free_labels
+
+    # Join subscripts with comma
+    einsum_str = ''.join(lhs_labels) + ',' + ''.join(rhs_labels) + '->' + ''.join(out_labels)
+
+    return np.einsum(einsum_str, a, b)
+
 def batch_contract(a, b, lhs_dims, rhs_dims, lhs_batch_dims, rhs_batch_dims):
     """
     Perform a batched tensor contraction between tensors a and b.
@@ -590,13 +635,13 @@ def batch_contract(a, b, lhs_dims, rhs_dims, lhs_batch_dims, rhs_batch_dims):
     # Reshape to combine batch dims and free dims
     a_reshaped = a_transposed.reshape(
         (-1,) +
-        (np.prod(a_shape[n_batch:-n_contract]),) +
-        (np.prod(a_shape[-n_contract:]),))
+        (np.prod(a_shape[n_batch:-n_contract], dtype=np.int64),) +
+        (np.prod(a_shape[-n_contract:], dtype=np.int64),))
 
     b_reshaped = b_transposed.reshape(
         (-1,) +
-        (np.prod(b_shape[n_batch:-n_contract]),) +
-        (np.prod(b_shape[-n_contract:]),))
+        (np.prod(b_shape[n_batch:-n_contract], dtype=np.int64),) +
+        (np.prod(b_shape[-n_contract:], dtype=np.int64),))
 
     # Transpose b to get contract dims first for matmul
     b_reshaped = np.transpose(b_reshaped, (0, 2, 1))
@@ -703,12 +748,8 @@ class Interpreter:
         lhs_b = expr.metadata['lhs_batch_dims']
         rhs_b = expr.metadata['rhs_batch_dims']
 
-        # Default numpy matmul: contract last dim of a with first dim of b
-        if not lhs_c and not rhs_c and not lhs_b and not rhs_b:
-            return a @ b
-
         # Full dot general using batch_contract
-        return batch_contract(a, b, lhs_c, rhs_c, lhs_batch_dims=lhs_b, rhs_batch_dims=rhs_b)
+        return batch_contract_einsum(a, b, lhs_c, rhs_c, lhs_batch_dims=lhs_b, rhs_batch_dims=rhs_b)
 
     def visit_op_transpose(self, expr: Op) -> Any:
         axes = expr.metadata.get('axes')
@@ -775,7 +816,7 @@ class Transform:
             self.fn = fn
             self.signature = inspect.signature(fn)
             self.transforms = transforms
-            self.static_fields = static_argnames or set()
+            self.static_argnames = static_argnames or set()
         self.expr_cache = {}
 
     @staticmethod
@@ -828,7 +869,7 @@ class Transform:
             return Tracer(Var(arg_index, arg_spec.dtype, arg_spec.shape), supervisor)
         trace_vars = pt.map(make_var, full_tree, index_tree).to_value()
         result = self.fn(*trace_vars)
-        index_tuple = index_tree.to_sequence()
+        index_tuple = index_tree.to_sequence(False)
         assert isinstance(index_tuple, Tuple)
         if isinstance(result, Tracer):
             lambda_expr = supervisor.create_lambda(index_tuple, pt.leaf(result.idx))
@@ -849,7 +890,7 @@ class Transform:
         arg_specs = []
         arg_masks = []
         for name, arg in bound_args.arguments.items():
-            is_static = name in self.static_fields
+            is_static = name in self.static_argnames
             arg_masks.append(not is_static)
             if is_static:
                 arg_specs.append(arg)
