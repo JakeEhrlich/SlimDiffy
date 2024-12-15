@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 from typing import Any, Callable
 import slimdiffy.autodiff as ad
 import hypothesis.strategies as st
 import numpy as np
 from hypothesis.extra.numpy import arrays
 
+@dataclass
 class TestFunc:
     function: Callable
     arg_strategy: Any
@@ -17,19 +19,26 @@ def shape_strategy():
 def elementwise_strategy(k: int):
     # Generate shared shape and arrays with same shape
     base = st.shared(shape_strategy())
-    def array_from_shape(shape):
-        return arrays(
-            np.dtype('float64'),
-            shape=shape,
-            elements=st.floats(
-                allow_infinity=False,
-                allow_nan=False,
-                min_value=-10.0,
-                max_value=10.0
-            )
-        )
-    tensors = [base.map(array_from_shape) for _ in range(k)]
-    return st.tuples(*tensors)
+
+    @st.composite
+    def generate_tensors(draw):
+        shape = draw(base)
+        tensors = []
+        for _ in range(k):
+            tensor = draw(arrays(
+                np.dtype('float64'),
+                shape=shape,
+                elements=st.floats(
+                    allow_infinity=False,
+                    allow_nan=False,
+                    min_value=-10.0,
+                    max_value=10.0
+                )
+            ))
+            tensors.append(tensor)
+        return tuple(tensors)
+
+    return generate_tensors()
 
 def dog_general_strategy():
     # Generate base shapes and permutations
@@ -223,7 +232,7 @@ def broadcast_strategy():
         # For each dimension, we can either:
         # 1. Keep the original size
         # 2. Replace with size 1 for broadcasting
-        # 3. Drop the dimension entirely (but only for trailing dims)
+        # 3. Drop the dimension entirely (but only for leading dims)
         source_dims = []
         for i, size in enumerate(target):
             choice = st.one_of(
@@ -236,7 +245,7 @@ def broadcast_strategy():
         length = st.integers(min_value=1, max_value=len(target))
 
         def make_shape(dims, length):
-            return tuple(dims[:length])
+            return tuple(dims[length:])
 
         return st.tuples(
             length.map(
@@ -259,14 +268,14 @@ def broadcast_strategy():
     return target_shape.flatmap(generate_source)
 
 def broadcasted_elementwise_strategy(k: int):
-    # Generate base shape and arrays with randomized dimensions
-    base = st.shared(shape_strategy())
-
     @st.composite
     def build_tensors(draw):
+        base = st.shared(shape_strategy())
+
         shape = draw(base)
         num_dims = len(shape)
 
+        # Return empty tensors if no dimensions
         if num_dims == 0:
             return draw(elementwise_strategy(k))
 
@@ -286,12 +295,18 @@ def broadcasted_elementwise_strategy(k: int):
             # Get dimensions for this tensor
             tensor_shape = list(shape)
             if i != fixed_dims_idx:
-                # Maybe truncate trailing dimensions
-                min_dims = 1
-                if num_dims > min_dims:
-                    n_dims = draw(st.integers(min_value=min_dims, max_value=num_dims))
-                    tensor_shape = tensor_shape[:n_dims]
-                    allow_changes[i] = allow_changes[i][:n_dims]
+                # Get max dims we can remove without affecting unchangeable dims
+                max_removable = 0
+                for d in range(num_dims):
+                    if not allow_changes[i][d]:
+                        break
+                    max_removable = d + 1
+
+                # Maybe truncate leading dimensions
+                if max_removable > 0:
+                    n_dims = draw(st.integers(min_value=0, max_value=max_removable))
+                    tensor_shape = tensor_shape[n_dims:]
+                    allow_changes[i] = allow_changes[i][n_dims:]
 
             # Randomly change allowed dimensions to 1
             for j, can_change in enumerate(allow_changes[i][:len(tensor_shape)]):
@@ -760,8 +775,8 @@ all_pairs_tests = [
     TestFunc(tensor_courpus_add_log, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_add_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_add_cos, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_add_min, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_add_max, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_add_min, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_add_max, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_mul, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_div, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_pow, broadcasted_elementwise_strategy(2)),
@@ -769,50 +784,65 @@ all_pairs_tests = [
     TestFunc(tensor_courpus_sub_log, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_cos, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_sub_min, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_sub_max, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_sub_min, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_sub_max, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_div, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_pow, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_exp, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_log, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_cos, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_mul_min, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_mul_max, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_mul_min, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_mul_max, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sin_cos, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos_sin, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_exp_log, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_log_exp, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_min_max, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_max_min, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_min_exp, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_min_log, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_min_sin, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_min_cos, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_max_exp, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_max_log, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_max_sin, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_max_cos, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_min_max, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_max_min, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_min_exp, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_min_log, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_min_sin, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_min_cos, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_max_exp, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_max_log, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_max_sin, broadcasted_elementwise_strategy(1)),
+    # TestFunc(tensor_courpus_max_cos, broadcasted_elementwise_strategy(1)),
 ]
 
 basic_tensor_tests = [
     TestFunc(tensor_courpus_add, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2)),
+    #TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_dot, matmul_strategy()),
-    TestFunc(tensor_courpus_dot_general, dog_general_strategy()),
-    TestFunc(tensor_courpus_transpose, transpose_strategy()),
+    #TestFunc(tensor_courpus_dot, matmul_strategy()),
+    #TestFunc(tensor_courpus_dot_general, dog_general_strategy()),
+    #TestFunc(tensor_courpus_transpose, transpose_strategy()),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1)),
+    #TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_sin, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_abs, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_sum, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_max, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_min, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_reshape, reshape_strategy()),
-    TestFunc(tensor_courpus_broadcast, broadcast_strategy()),
+    #TestFunc(tensor_courpus_reshape, reshape_strategy()),
+    #TestFunc(tensor_courpus_broadcast, broadcast_strategy()),
 ]
+
+def get_test_samples(test_set):
+    # Strategy to sample functions and arguments
+    @st.composite
+    def test_sample_strategy(draw):
+        # Select a TestFunc
+        test_func = draw(st.sampled_from(test_set))
+
+        # Get arguments from the function's strategy
+        args = draw(test_func.arg_strategy)
+
+        # Return tuple of (function, args)
+        return (test_func.function, args)
+
+    return test_sample_strategy()

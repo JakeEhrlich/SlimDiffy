@@ -185,7 +185,15 @@ class Tracer:
         except ValueError:
             raise ValueError(f"Cannot broadcast shapes {self_expr.shape} and {other_expr.shape}")
 
-        return Tracer(Op(op, [self.idx, other.idx], self_expr.dtype, out_shape), self.supervisor)
+        # Insert explicit broadcasts if needed
+        a = self
+        b = other
+        if self_expr.shape != out_shape:
+            a = self.broadcast_to(out_shape)
+        if other_expr.shape != out_shape:
+            b = other.broadcast_to(out_shape)
+
+        return Tracer(Op(op, [a.idx, b.idx], self_expr.dtype, out_shape), self.supervisor)
 
     def _unary_op(self, op: OpType) -> 'Tracer':
         self_expr = self.supervisor.equations[self.idx]
@@ -935,14 +943,15 @@ class Gradient:
         # Build list of axes to sum over
         sum_axes = []
 
+        padded_shape = []
+        for i in range(len(input_shape), len(output_shape)):
+            padded_shape.append(1)
+        padded_shape.extend(input_shape)
+
         # Check dimensions that were broadcast from 1 to match output
-        for i, (s1, s2) in enumerate(zip(input_shape, output_shape[-len(input_shape):])):
+        for i, (s1, s2) in enumerate(zip(padded_shape, output_shape)):
             if s1 == 1 and s2 > 1:
                 sum_axes.append(i + n_leading)
-
-        # Add remaining dimensions that had to be padded with 1s
-        for i in range(len(input_shape), len(output_shape)):
-            sum_axes.append(i + n_leading)
 
         # Sum over broadcast dimensions if any
         result = derivative.sum(tuple(sum_axes), keepdims=True) if sum_axes else derivative
@@ -961,69 +970,66 @@ class Gradient:
         pass
 
     def visit_add(self, eq: Op, derivative: Tracer) -> None:
-        a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative)
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative)
+        self.derivatives[eq.inputs[0]] += derivative
+        self.derivatives[eq.inputs[1]] += derivative
 
     def visit_mul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * b)
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * a)
+        self.derivatives[eq.inputs[0]] += derivative * b
+        self.derivatives[eq.inputs[1]] += derivative * a
 
     def visit_sub(self, eq: Op, derivative: Tracer) -> None:
-        a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative)
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, -derivative)
+        self.derivatives[eq.inputs[0]] += derivative
+        self.derivatives[eq.inputs[1]] += -derivative
 
     def visit_div(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative / b)
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, -derivative * a / (b * b))
+        self.derivatives[eq.inputs[0]] += derivative / b
+        self.derivatives[eq.inputs[1]] += -derivative * a / (b * b)
 
     def visit_pow(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * b * a ** (b - 1))
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (a ** b) * log(a))
+        self.derivatives[eq.inputs[0]] += derivative * b * a ** (b - 1)
+        self.derivatives[eq.inputs[1]] += derivative * (a ** b) * log(a)
 
     def visit_neg(self, eq: Op, derivative: Tracer) -> None:
-        input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, -derivative)
+        self.derivatives[eq.inputs[0]] += -derivative
 
     def visit_exp(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * exp(input_val))
+        self.derivatives[eq.inputs[0]] += derivative * exp(input_val)
 
     def visit_log(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative / input_val)
+        self.derivatives[eq.inputs[0]] += derivative / input_val
 
     def visit_sin(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * cos(input_val))
+        self.derivatives[eq.inputs[0]] += derivative * cos(input_val)
 
     def visit_cos(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, -derivative * sin(input_val))
+        self.derivatives[eq.inputs[0]] += -derivative * sin(input_val)
 
     def visit_abs(self, eq: Op, derivative: Tracer) -> None:
         input_val = self.equation_map[eq.inputs[0]]
-        self._handle_broadcast_derivative(eq.inputs[0], input_val.shape, eq.shape, derivative * abs(input_val) / input_val)
+        self.derivatives[eq.inputs[0]] += derivative * abs(input_val) / input_val
 
     def visit_maximum(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         mask_a = (a > b)
         mask_b = (b > a)
         equal = (a == b)
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
+        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
+        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
 
     def visit_minimum(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
         mask_a = (a < b)
         mask_b = (b < a)
         equal = (a == b)
-        self._handle_broadcast_derivative(eq.inputs[0], a.shape, eq.shape, derivative * (mask_a + equal * 0.5))
-        self._handle_broadcast_derivative(eq.inputs[1], b.shape, eq.shape, derivative * (mask_b + equal * 0.5))
+        self.derivatives[eq.inputs[0]] += derivative * (mask_a + equal * 0.5)
+        self.derivatives[eq.inputs[1]] += derivative * (mask_b + equal * 0.5)
 
     def visit_dot(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
@@ -1112,10 +1118,7 @@ class Gradient:
 
         # For jacobian case, we need to preserve leading dims from derivative
         # and append original input shape for broadcasting
-        if len(derivative.shape) > len(eq.shape):
-            broadcast_shape = derivative.shape[:-len(eq.shape)] + output_shape
-        else:
-            broadcast_shape = output_shape
+        broadcast_shape = derivative.shape[:-len(eq.shape)] + output_shape
 
         self.derivatives[eq.inputs[0]] += derivative.broadcast_to(broadcast_shape)
 
