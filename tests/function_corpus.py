@@ -31,7 +31,7 @@ def elementwise_strategy(k: int):
                 elements=st.floats(
                     allow_infinity=False,
                     allow_nan=False,
-                    min_value=-10.0,
+                    min_value=0.1,  # Ensure positive values for log and non-zero for div
                     max_value=10.0
                 )
             ))
@@ -267,7 +267,7 @@ def broadcast_strategy():
 
     return target_shape.flatmap(generate_source)
 
-def broadcasted_elementwise_strategy(k: int):
+def broadcasted_elementwise_strategy(k: int, min_value=-10.0, max_value=10.0):
     @st.composite
     def build_tensors(draw):
         base = st.shared(shape_strategy())
@@ -321,8 +321,8 @@ def broadcasted_elementwise_strategy(k: int):
                     elements=st.floats(
                         allow_infinity=False,
                         allow_nan=False,
-                        min_value=-10.0,
-                        max_value=10.0
+                        min_value=min_value,
+                        max_value=max_value
                     )
                 )
             ))
@@ -814,14 +814,14 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_add, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_div, broadcasted_elementwise_strategy(2, min_value=0.1, max_value=10.0)),  # Safe range for division
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_dot, matmul_strategy()),
     #TestFunc(tensor_courpus_dot_general, dog_general_strategy()),
     #TestFunc(tensor_courpus_transpose, transpose_strategy()),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
-    #TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1)),
+    TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1, min_value=0.1, max_value=10.0)),  # Safe range for logarithm
     TestFunc(tensor_courpus_sin, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_abs, broadcasted_elementwise_strategy(1)),
