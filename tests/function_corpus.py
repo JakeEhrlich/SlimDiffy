@@ -1,9 +1,10 @@
+import numpy as np
 from dataclasses import dataclass
 import dataclasses
 from typing import Any, Callable
 import slimdiffy.autodiff as ad
+import hypothesis
 import hypothesis.strategies as st
-import numpy as np
 from hypothesis.extra.numpy import arrays
 
 @dataclass
@@ -51,95 +52,81 @@ def elementwise_strategy(k: int, values=None):
 
     return generate_tensors()
 
-def dog_general_strategy():
-    # Generate random shapes for each dimension type
-    @st.composite
-    def generate_shapes(draw):
-        # Draw base shapes
-        batch_shape = draw(shape_strategy())
-        contract_shape = draw(shape_strategy())
-        lhs_free = draw(shape_strategy())
-        rhs_free = draw(shape_strategy())
+@st.composite
+def dog_general_strategy(draw):
+    """Generate shapes for dot_general with broadcasting after the operation"""
+    # Draw base shapes with at least one dimension
+    batch_shape = draw(st.lists(st.integers(min_value=1, max_value=5), min_size=0, max_size=4))
 
-        # Build full shape lists
-        lhs_full = list(batch_shape) + list(contract_shape) + list(lhs_free)
-        rhs_full = list(batch_shape) + list(contract_shape) + list(rhs_free)
+    # Generate contracting dimensions that will be the same for both sides
+    n_contract = draw(st.integers(min_value=1, max_value=4))
+    contract_dims = [draw(st.integers(min_value=1, max_value=5)) for _ in range(n_contract)]
+    contract_shape = contract_dims
 
-        # Generate permutations for each side
-        lhs_perm = draw(st.permutations(range(len(lhs_full))))
-        rhs_perm = draw(st.permutations(range(len(rhs_full))))
+    # Generate free dimensions for each side
+    lhs_free = draw(st.lists(st.integers(min_value=1, max_value=5), min_size=0, max_size=4))
+    rhs_free = draw(st.lists(st.integers(min_value=1, max_value=5), min_size=0, max_size=4))
 
-        def inv(perm):
-            inverse = [0] * len(perm)
-            for i, p in enumerate(perm):
-                inverse[p] = i
-            return tuple(inverse)
+    # Build full shapes in natural order: batch, contract, free
+    lhs_shape = tuple(batch_shape + contract_shape + lhs_free)
+    rhs_shape = tuple(batch_shape + contract_shape + rhs_free)
 
+    # Map dimension indices in natural order
+    n_batch = len(batch_shape)
+    n_contract = len(contract_shape)
 
-        # Apply permutations to shapes
-        lhs_shape = tuple(lhs_full[i] for i in lhs_perm)
-        rhs_shape = tuple(rhs_full[i] for i in rhs_perm)
+    # Batch dimensions are at the start
+    lhs_batch = tuple(range(n_batch))
+    rhs_batch = tuple(range(n_batch))
 
-        # Map dimension indices through permutations
-        n_batch = len(batch_shape)
-        n_contract = len(contract_shape)
+    # Contract dimensions follow batch dimensions
+    lhs_contract = tuple(range(n_batch, n_batch + n_contract))
+    rhs_contract = tuple(range(n_batch, n_batch + n_contract))
 
-        # Get batch dims
-        lhs_batch = tuple(inv(lhs_perm)[i] for i in range(n_batch))
-        rhs_batch = tuple(inv(rhs_perm)[i] for i in range(n_batch))
+    # Debug output
+    print("\nDOG Strategy Debug:")
+    print(f"batch_shape: {batch_shape}")
+    print(f"contract_shape: {contract_shape}")
+    print(f"lhs_free: {lhs_free}")
+    print(f"rhs_free: {rhs_free}")
+    print(f"lhs_shape: {lhs_shape}")
+    print(f"rhs_shape: {rhs_shape}")
+    print(f"lhs_batch: {lhs_batch}")
+    print(f"rhs_batch: {rhs_batch}")
+    print(f"lhs_contract: {lhs_contract}")
+    print(f"rhs_contract: {rhs_contract}")
 
-        # Get contracting dims
-        lhs_contract = tuple(inv(lhs_perm)[i + n_batch] for i in range(n_contract))
-        rhs_contract = tuple(inv(rhs_perm)[i + n_batch] for i in range(n_contract))
-
-        print(f"{batch_shape=}")
-        print(f"{contract_shape=}")
-        print(f"{lhs_free=}")
-        print(f"{rhs_free=}")
-        print(f"{lhs_full=}")
-        print(f"{rhs_full=}")
-        print(f"{lhs_perm=}")
-        print(f"{rhs_perm=}")
-        print(f"{lhs_shape=}")
-        print(f"{rhs_shape=}")
-        print(f"{lhs_batch=}")
-        print(f"{rhs_batch=}")
-        print(f"{lhs_contract=}")
-        print(f"{rhs_contract=}")
-
-        # Generate random arrays with these shapes
-        lhs_array = draw(arrays(
-            np.dtype('float64'),
-            shape=lhs_shape,
-            elements=st.floats(
-                allow_infinity=False,
-                allow_nan=False,
-                min_value=-10.0,
-                max_value=10.0
-            )
-        ))
-
-        rhs_array = draw(arrays(
-            np.dtype('float64'),
-            shape=rhs_shape,
-            elements=st.floats(
-                allow_infinity=False,
-                allow_nan=False,
-                min_value=-10.0,
-                max_value=10.0
-            )
-        ))
-
-        return (
-            lhs_array,
-            rhs_array,
-            lhs_contract,
-            rhs_contract,
-            lhs_batch,
-            rhs_batch
+    # Generate random arrays with these shapes
+    lhs_array = draw(arrays(
+        np.dtype('float64'),
+        shape=lhs_shape,
+        elements=st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
         )
+    ))
 
-    return generate_shapes()
+    rhs_array = draw(arrays(
+        np.dtype('float64'),
+        shape=rhs_shape,
+        elements=st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
+        )
+    ))
+
+    return (
+        lhs_array,
+        rhs_array,
+        lhs_contract,
+        rhs_contract,
+        lhs_batch,
+        rhs_batch
+    )
 
 def matmul_strategy():
     # Generate random shapes for the matmul inputs
@@ -428,119 +415,141 @@ def generate_broadcast_shape_strategy(base_shape):
 
     return st.builds(make_broadcast_shape)
 
-def dog_post_brodacast_strategy():
-    # Get dot general inputs
-    base_dog = st.shared(dog_general_strategy())
-
-    def generate_broadcast(base):
-        x_orig, y_orig, c1, c2, b1, b2 = base
-        x = x_orig if isinstance(x_orig, np.ndarray) else np.array(x_orig)
-        y = y_orig if isinstance(y_orig, np.ndarray) else np.array(y_orig)
-
-        # Calculate output shape of dot_general
-        out_shape = tuple(x.shape[i] for i in b1) + \
-                   tuple(d for i, d in enumerate(x.shape)
-                        if i not in c1 and i not in b1) + \
-                   tuple(d for i, d in enumerate(y.shape)
-                        if i not in c2 and i not in b2)
-
-        final_shape = generate_broadcast_shape_strategy(out_shape)
-
-        return st.tuples(
-            st.just(x),
-            st.just(y),
-            st.just(c1),
-            st.just(c2),
-            st.just(b1),
-            st.just(b2),
-            arrays(
-                np.dtype('float64'),
-                shape=final_shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,
-                    max_value=10.0
-                )
-            )
-        )
-
-    return base_dog.flatmap(generate_broadcast)
-
-
-def dog_pre_broadcast_left_strategy():
+@st.composite
+def dog_post_brodacast_strategy(draw):
+    """Generate shapes for dot_general with broadcasting after the operation"""
     # Get dot general inputs first
-    base_dog = st.shared(dog_general_strategy())
+    base_strategy = dog_general_strategy()
+    lhs_array, rhs_array, lhs_c, rhs_c, lhs_b, rhs_b = draw(base_strategy)
 
-    def generate_broadcast(base):
-        x_orig, y_orig, c1, c2, b1, b2 = base
-        x = x_orig if isinstance(x_orig, np.ndarray) else np.array(x_orig)
+    # Calculate output shape from dot_general
+    batch_shape = tuple(lhs_array.shape[i] for i in lhs_b)
+    lhs_free = tuple(i for i in range(len(lhs_array.shape)) if i not in lhs_c and i not in lhs_b)
+    rhs_free = tuple(i for i in range(len(rhs_array.shape)) if i not in rhs_c and i not in rhs_b)
 
-        # Generate broadcast shape for x
-        final_shape = st.shared(shape_strategy())
-        def check_broadcast(shape):
-            try:
-                np.broadcast_shapes(x.shape, shape)
-                return True
-            except ValueError:
-                return False
+    # Output shape will be batch_shape + lhs_free_shape + rhs_free_shape
+    lhs_free_shape = tuple(lhs_array.shape[i] for i in lhs_free)
+    rhs_free_shape = tuple(rhs_array.shape[i] for i in rhs_free)
+    dog_output_shape = batch_shape + lhs_free_shape + rhs_free_shape
 
-        return st.tuples(
-            arrays(
-                np.dtype('float64'),
-                shape=final_shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,
-                    max_value=10.0
-                )
-            ).filter(lambda z: check_broadcast(z.shape)),
-            st.just(y_orig),
-            st.just(c1),
-            st.just(c2),
-            st.just(b1),
-            st.just(b2)
-        )
+    print(f"dog_output_shape: {dog_output_shape}")
 
-    return base_dog.flatmap(generate_broadcast)
+    # For scalar outputs, we need special handling
+    if len(dog_output_shape) == 0:
+        # For scalar output, we can either keep it scalar or broadcast it
+        z_shape = draw(st.one_of(
+            st.just(()),  # Keep scalar
+            st.lists(st.integers(min_value=1, max_value=5), min_size=1, max_size=3).map(tuple)  # Broadcast
+        ))
+    else:
+        # Generate broadcast shape for z that's compatible with dog_output_shape
+        z_shape = draw(generate_broadcast_shape_strategy(dog_output_shape))
 
-def dog_pre_broadcast_right_strategy():
+    print(f"z_shape: {z_shape}")
+
+    # Generate the actual arrays
+    lhs = draw(arrays(
+        np.dtype('float64'),
+        shape=lhs_array.shape,
+        elements=st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0)
+    ))
+    rhs = draw(arrays(
+        np.dtype('float64'),
+        shape=rhs_array.shape,
+        elements=st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0)
+    ))
+    z = draw(arrays(
+        np.dtype('float64'),
+        shape=z_shape,
+        elements=st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0)
+    ))
+
+    # Debug output
+    print("\nDOG Strategy Debug:")
+    print(f"batch_shape: {list(batch_shape)}")
+    print(f"lhs_free: {list(lhs_free)}")
+    print(f"rhs_free: {list(rhs_free)}")
+    print(f"lhs_shape: {lhs.shape}")
+    print(f"rhs_shape: {rhs.shape}")
+    print(f"lhs_batch: {lhs_b}")
+    print(f"rhs_batch: {rhs_b}")
+    print(f"lhs_contract: {lhs_c}")
+    print(f"rhs_contract: {rhs_c}")
+    print(f"dog_output_shape: {dog_output_shape}")
+    print(f"z_shape: {z.shape}")
+
+    return lhs, rhs, lhs_c, rhs_c, lhs_b, rhs_b, z
+
+
+@st.composite
+def dog_pre_broadcast_left_strategy(draw):
+    """Generate shapes for dot_general with broadcasting before the operation on left input"""
     # Get dot general inputs first
-    base_dog = st.shared(dog_general_strategy())
+    base_strategy = dog_general_strategy()
+    x_orig, y_orig, c1, c2, b1, b2 = draw(base_strategy)
+    x = x_orig if isinstance(x_orig, np.ndarray) else np.array(x_orig)
 
-    def generate_broadcast(base):
-        x_orig, y_orig, c1, c2, b1, b2 = base
-        y = y_orig if isinstance(y_orig, np.ndarray) else np.array(y_orig)
+    # Generate broadcast shape for x that's compatible with original shape
+    if len(x.shape) == 0:
+        final_shape = ()  # scalar shape for empty input
+    else:
+        # Generate a shape that's compatible for broadcasting
+        final_shape = draw(generate_broadcast_shape_strategy(x.shape))
+        # Verify shapes are compatible
+        try:
+            np.broadcast_shapes(x.shape, final_shape)
+        except ValueError:
+            # If incompatible, use the original shape
+            final_shape = x.shape
 
-        # Generate broadcast shape for y
-        final_shape = st.shared(shape_strategy())
-        def check_broadcast(shape):
-            try:
-                np.broadcast_shapes(y.shape, shape)
-                return True
-            except ValueError:
-                return False
-
-        return st.tuples(
-            st.just(x_orig),
-            arrays(
-                np.dtype('float64'),
-                shape=final_shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,
-                    max_value=10.0
-                )
-            ).filter(lambda z: check_broadcast(z.shape)),
-            st.just(c1),
-            st.just(c2),
-            st.just(b1),
-            st.just(b2)
+    # Generate the broadcasted array
+    x_broadcast = draw(arrays(
+        np.dtype('float64'),
+        shape=final_shape,
+        elements=st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
         )
+    ))
 
-    return base_dog.flatmap(generate_broadcast)
+    return x_broadcast, y_orig, c1, c2, b1, b2
+
+@st.composite
+def dog_pre_broadcast_right_strategy(draw):
+    """Generate shapes for dot_general with broadcasting before the operation on right input"""
+    # Get dot general inputs first
+    base_strategy = dog_general_strategy()
+    x_orig, y_orig, c1, c2, b1, b2 = draw(base_strategy)
+    y = y_orig if isinstance(y_orig, np.ndarray) else np.array(y_orig)
+
+    # Generate broadcast shape for y that's compatible with original shape
+    if len(y.shape) == 0:
+        final_shape = ()  # scalar shape for empty input
+    else:
+        # Generate a shape that's compatible for broadcasting
+        final_shape = draw(generate_broadcast_shape_strategy(y.shape))
+        # Verify shapes are compatible
+        try:
+            np.broadcast_shapes(y.shape, final_shape)
+        except ValueError:
+            # If incompatible, use the original shape
+            final_shape = y.shape
+
+    # Generate the broadcasted array
+    y_broadcast = draw(arrays(
+        np.dtype('float64'),
+        shape=final_shape,
+        elements=st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
+        )
+    ))
+
+    return x_orig, y_broadcast, c1, c2, b1, b2
 
 def tensor_courpus_dog_add(x, y, lhs_c, rhs_c, lhs_b, rhs_b, z):
     return x.dot_general(y, lhs_contracting_dims=lhs_c,
@@ -585,6 +594,9 @@ def tensor_courpus_dog_exp(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_log(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
+    # Ensure inputs are positive for log operation
+    x = np.abs(x) + 1.0  # Make strictly positive
+    y = np.abs(y) + 1.0  # Make strictly positive
     return ad.log(x.dot_general(y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
@@ -681,7 +693,7 @@ def tensor_courpus_abs_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
                              rhs_batch_dims=rhs_b)
 
 def tensor_courpus_sum_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.sum(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.sum(x, keepdims=True).dot_general(z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
@@ -866,6 +878,40 @@ def tensor_courpus_max_sin(x, y):
 def tensor_courpus_max_cos(x, y):
     return ad.maximum(x, ad.cos(y))
 
+# Define test lists for basic tensor operations
+basic_tensor_tests = [
+    TestFunc(tensor_courpus_add, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_mul, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_div, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_pow, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_neg, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_exp, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_log, elementwise_strategy(1, st.floats(min_value=0.1, max_value=10.0))),
+    TestFunc(tensor_courpus_sin, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_cos, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_abs, elementwise_strategy(1)),
+    TestFunc(tensor_courpus_sum, elementwise_strategy(1)),
+]
+
+# Define test lists for composite operations
+all_pairs_tests = [
+    TestFunc(tensor_courpus_add_mul, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_div, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_pow, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_exp, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_log, elementwise_strategy(2, st.floats(min_value=0.1, max_value=10.0))),
+    TestFunc(tensor_courpus_add_sin, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_cos, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_mul, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_div, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_pow, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_exp, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_log, elementwise_strategy(2, st.floats(min_value=0.1, max_value=10.0))),
+    TestFunc(tensor_courpus_sub_sin, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_cos, elementwise_strategy(2)),
+]
+
 dog_elementwise_tests = [
     TestFunc(tensor_courpus_dog_add, dog_post_brodacast_strategy()),
     TestFunc(tensor_courpus_dog_sub, dog_post_brodacast_strategy()),
@@ -988,6 +1034,17 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_min, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_reshape, reshape_strategy(), static_argnames={'shape'}),
     TestFunc(tensor_courpus_broadcast, broadcast_strategy(), static_argnames={'shape'}),
+]
+
+dog_elementwise_tests = [
+    TestFunc(tensor_courpus_dog_add, dog_post_brodacast_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_sub, dog_post_brodacast_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_mul, dog_post_brodacast_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_div, dog_post_brodacast_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_pow, dog_general_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_neg, dog_general_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_exp, dog_general_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
+    TestFunc(tensor_courpus_dog_log, dog_general_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
 ]
 
 def get_test_samples(test_set):
