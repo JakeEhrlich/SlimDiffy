@@ -458,6 +458,24 @@ def transpose(x, axes):
         return x.transpose(*axes)
     return np.transpose(x, axes)
 
+def dot_general(x, y, *, lhs_contracting_dims, rhs_contracting_dims, lhs_batch_dims, rhs_batch_dims):
+    if isinstance(x, Tracer):
+        return x.dot_general(y, lhs_contracting_dims=lhs_contracting_dims,
+                        rhs_contracting_dims=rhs_contracting_dims,
+                        lhs_batch_dims=lhs_batch_dims,
+                        rhs_batch_dims=rhs_batch_dims)
+    elif isinstance(y, Tracer):
+        x = _ensure_tracer(x, y.supervisor)
+        return x.dot_general(y,
+                        lhs_contracting_dims=lhs_contracting_dims,
+                        rhs_contracting_dims=rhs_contracting_dims,
+                        lhs_batch_dims=lhs_batch_dims,
+                        rhs_batch_dims=rhs_batch_dims)
+    else:
+        return batch_contract_einsum(x, y, lhs_contracting_dims, rhs_contracting_dims,
+                                   lhs_batch_dims=lhs_batch_dims,
+                                   rhs_batch_dims=rhs_batch_dims)
+
 def broadcast_to(x, shape):
     if isinstance(x, Tracer):
         return x.broadcast_to(shape)

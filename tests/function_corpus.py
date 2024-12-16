@@ -52,60 +52,72 @@ def elementwise_strategy(k: int, values=None):
     return generate_tensors()
 
 def dog_general_strategy():
-    # Generate base shapes and permutations
-    batch_shape = st.shared(shape_strategy().map(lambda x: (len(x), x)))
-    contract_shape = st.shared(shape_strategy().map(lambda x: (len(x), x)))
-    lhs_free_shape = shape_strategy()
-    rhs_free_shape = shape_strategy()
+    # Generate random shapes for each dimension type
+    @st.composite
+    def generate_shapes(draw):
+        # Draw base shapes
+        batch_shape = draw(shape_strategy())
+        contract_shape = draw(shape_strategy())
+        lhs_free = draw(shape_strategy())
+        rhs_free = draw(shape_strategy())
 
-    def make_raw_shapes(batch, contract, free):
-        n_batch, batch_dims = batch
-        n_contract, contract_dims = contract
+        # Build full shape lists
+        lhs_full = list(batch_shape) + list(contract_shape) + list(lhs_free)
+        rhs_full = list(batch_shape) + list(contract_shape) + list(rhs_free)
 
-        # Build dimension lists
-        full_shape = list(batch_dims) + list(contract_dims) + list(free)
-        full_range = list(range(len(full_shape)))
+        # Generate permutations for each side
+        lhs_perm = draw(st.permutations(range(len(lhs_full))))
+        rhs_perm = draw(st.permutations(range(len(rhs_full))))
 
-        # Generate permutations of the indices
-        return (st.permutations(full_range).map(lambda p: (
-            # Permute the dimensions using the index permutation
-            tuple(full_shape[i] for i in p),
-            # Map batch indices through permutation
-            tuple(p[i] for i in range(n_batch)),
-            # Map contract indices through permutation
-            tuple(p[i] for i in range(n_batch, n_batch + n_contract)),
-            # Map free indices through permutation
-            tuple(p[i] for i in range(n_batch + n_contract,
-                                    n_batch + n_contract + len(free)))
-        )))
+        # Apply permutations to shapes
+        lhs_shape = tuple(lhs_full[i] for i in lhs_perm)
+        rhs_shape = tuple(rhs_full[i] for i in rhs_perm)
 
-    def combine_shapes(bshape, cshape, lhs_free, rhs_free):
-        # Get permuted shapes and indices
-        lhs_data = make_raw_shapes(bshape, cshape, lhs_free)
-        rhs_data = make_raw_shapes(bshape, cshape, rhs_free)
+        # Map dimension indices through permutations
+        n_batch = len(batch_shape)
+        n_contract = len(contract_shape)
 
-        def combine_data(lhs_perm_data, rhs_perm_data):
-            lhs_shape, lhs_b, lhs_c, lhs_f = lhs_perm_data
-            rhs_shape, rhs_b, rhs_c, rhs_f = rhs_perm_data
+        # Get batch dims
+        lhs_batch = tuple(lhs_perm[i] for i in range(n_batch))
+        rhs_batch = tuple(rhs_perm[i] for i in range(n_batch))
 
-            return (
-                np.random.randn(*lhs_shape), # LHS tensor
-                np.random.randn(*rhs_shape), # RHS tensor
-                tuple(lhs_c),                # LHS contracting dims
-                tuple(rhs_c),                # RHS contracting dims
-                tuple(lhs_b),                # LHS batch dims
-                tuple(rhs_b)                 # RHS batch dims
+        # Get contracting dims
+        lhs_contract = tuple(lhs_perm[i] for i in range(n_batch, n_batch + n_contract))
+        rhs_contract = tuple(rhs_perm[i] for i in range(n_batch, n_batch + n_contract))
+
+        # Generate random arrays with these shapes
+        lhs_array = draw(arrays(
+            np.dtype('float64'),
+            shape=lhs_shape,
+            elements=st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
             )
+        ))
 
-        return st.tuples(lhs_data, rhs_data).map(
-            lambda x: combine_data(*x))
+        rhs_array = draw(arrays(
+            np.dtype('float64'),
+            shape=rhs_shape,
+            elements=st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+        ))
 
-    # Put it all together
-    return batch_shape.flatmap(lambda b:
-           contract_shape.flatmap(lambda c:
-           lhs_free_shape.flatmap(lambda lf:
-           rhs_free_shape.flatmap(lambda rf:
-           combine_shapes(b, c, lf, rf)))))
+        return (
+            lhs_array,
+            rhs_array,
+            lhs_contract,
+            rhs_contract,
+            lhs_batch,
+            rhs_batch
+        )
+
+    return generate_shapes()
 
 def matmul_strategy():
     # Generate random shapes for the matmul inputs
@@ -674,7 +686,7 @@ def tensor_courpus_dot(x, y):
     return x @ y
 
 def tensor_courpus_dot_general(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b)
@@ -866,7 +878,7 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_pow, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_neg, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_dot, matmul_strategy()),
-    #TestFunc(tensor_courpus_dot_general, dog_general_strategy(), static_argnames={'lhs_contracting_dims', 'rhs_contracting_dims', 'lhs_batch_dims', 'rhs_batch_dims'}),
+    TestFunc(tensor_courpus_dot_general, dog_general_strategy(), static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"}),
     TestFunc(tensor_courpus_transpose, transpose_strategy(), static_argnames={'axes'}),
     TestFunc(tensor_courpus_exp, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_log, broadcasted_elementwise_strategy(1, values=
