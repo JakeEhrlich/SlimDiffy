@@ -315,6 +315,7 @@ class Tracer:
         # Check contracting dimension sizes match
         for l, r in zip(lhs_contracting_dims, rhs_contracting_dims):
             if self_expr.shape[l] != other_expr.shape[r]:
+                breakpoint()
                 raise ValueError(f"Contracting dimension mismatch: {self_expr.shape[l]} != {other_expr.shape[r]}")
 
         # Check batch dimension sizes match

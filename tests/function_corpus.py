@@ -69,6 +69,13 @@ def dog_general_strategy():
         lhs_perm = draw(st.permutations(range(len(lhs_full))))
         rhs_perm = draw(st.permutations(range(len(rhs_full))))
 
+        def inv(perm):
+            inverse = [0] * len(perm)
+            for i, p in enumerate(perm):
+                inverse[p] = i
+            return tuple(inverse)
+
+
         # Apply permutations to shapes
         lhs_shape = tuple(lhs_full[i] for i in lhs_perm)
         rhs_shape = tuple(rhs_full[i] for i in rhs_perm)
@@ -78,12 +85,27 @@ def dog_general_strategy():
         n_contract = len(contract_shape)
 
         # Get batch dims
-        lhs_batch = tuple(lhs_perm[i] for i in range(n_batch))
-        rhs_batch = tuple(rhs_perm[i] for i in range(n_batch))
+        lhs_batch = tuple(inv(lhs_perm)[i] for i in range(n_batch))
+        rhs_batch = tuple(inv(rhs_perm)[i] for i in range(n_batch))
 
         # Get contracting dims
-        lhs_contract = tuple(lhs_perm[i] for i in range(n_batch, n_batch + n_contract))
-        rhs_contract = tuple(rhs_perm[i] for i in range(n_batch, n_batch + n_contract))
+        lhs_contract = tuple(inv(lhs_perm)[i + n_batch] for i in range(n_contract))
+        rhs_contract = tuple(inv(rhs_perm)[i + n_batch] for i in range(n_contract))
+
+        print(f"{batch_shape=}")
+        print(f"{contract_shape=}")
+        print(f"{lhs_free=}")
+        print(f"{rhs_free=}")
+        print(f"{lhs_full=}")
+        print(f"{rhs_full=}")
+        print(f"{lhs_perm=}")
+        print(f"{rhs_perm=}")
+        print(f"{lhs_shape=}")
+        print(f"{rhs_shape=}")
+        print(f"{lhs_batch=}")
+        print(f"{rhs_batch=}")
+        print(f"{lhs_contract=}")
+        print(f"{rhs_contract=}")
 
         # Generate random arrays with these shapes
         lhs_array = draw(arrays(
@@ -728,7 +750,7 @@ def tensor_courpus_add_mul(x, y):
     return (x + y) * (x + y)
 
 def tensor_courpus_add_div(x, y):
-    return (x + y) / (x + y)
+    return (x + y) / y
 
 def tensor_courpus_add_pow(x, y):
     return (x + y) ** 2
@@ -737,7 +759,7 @@ def tensor_courpus_add_exp(x, y):
     return ad.exp(x + y)
 
 def tensor_courpus_add_log(x, y):
-    return ad.log(x + y)
+    return x + ad.log(y)
 
 def tensor_courpus_add_sin(x, y):
     return ad.sin(x + y)
@@ -749,7 +771,7 @@ def tensor_courpus_sub_mul(x, y):
     return (x - y) * (x - y)
 
 def tensor_courpus_sub_div(x, y):
-    return (x - y) / (x - y)
+    return (x - y) / y
 
 def tensor_courpus_sub_pow(x, y):
     return (x - y) ** 2
@@ -758,7 +780,7 @@ def tensor_courpus_sub_exp(x, y):
     return ad.exp(x - y)
 
 def tensor_courpus_sub_log(x, y):
-    return ad.log(x - y)
+    return x - ad.log(y)
 
 def tensor_courpus_sub_sin(x, y):
     return ad.sin(x - y)
@@ -767,7 +789,7 @@ def tensor_courpus_sub_cos(x, y):
     return ad.cos(x - y)
 
 def tensor_courpus_mul_div(x, y):
-    return (x * y) / (x * y)
+    return (x * y) / y
 
 def tensor_courpus_mul_pow(x, y):
     return (x * y) ** 2
@@ -776,7 +798,7 @@ def tensor_courpus_mul_exp(x, y):
     return ad.exp(x * y)
 
 def tensor_courpus_mul_log(x, y):
-    return ad.log(x * y)
+    return x * ad.log(y)
 
 def tensor_courpus_mul_sin(x, y):
     return ad.sin(x * y)
@@ -795,6 +817,54 @@ def tensor_courpus_exp_log(x):
 
 def tensor_courpus_log_exp(x):
     return ad.log(ad.exp(x))
+
+def tensor_courpus_add_min(x, y):
+    return ad.minimum(x, y) + ad.minimum(x, y)
+
+def tensor_courpus_add_max(x, y):
+    return ad.maximum(x, y) + ad.maximum(x, y)
+
+def tensor_courpus_sub_min(x, y):
+    return ad.minimum(x, y) - ad.minimum(x, y)
+
+def tensor_courpus_sub_max(x, y):
+    return ad.maximum(x, y) - ad.maximum(x, y)
+
+def tensor_courpus_mul_min(x, y):
+    return ad.minimum(x, y) * ad.minimum(x, y)
+
+def tensor_courpus_mul_max(x, y):
+    return ad.maximum(x, y) * ad.maximum(x, y)
+
+def tensor_courpus_min_max(x, y):
+    return ad.minimum(x, ad.maximum(x, y))
+
+def tensor_courpus_max_min(x, y):
+    return ad.maximum(x, ad.minimum(x, y))
+
+def tensor_courpus_min_exp(x, y):
+    return ad.minimum(x, ad.exp(y))
+
+def tensor_courpus_min_log(x, y):
+    return ad.minimum(x, ad.log(y))
+
+def tensor_courpus_min_sin(x, y):
+    return ad.minimum(x, ad.sin(y))
+
+def tensor_courpus_min_cos(x, y):
+    return ad.minimum(x, ad.cos(y))
+
+def tensor_courpus_max_exp(x, y):
+    return ad.maximum(x, ad.exp(y))
+
+def tensor_courpus_max_log(x, y):
+    return ad.maximum(x, ad.log(y))
+
+def tensor_courpus_max_sin(x, y):
+    return ad.maximum(x, ad.sin(y))
+
+def tensor_courpus_max_cos(x, y):
+    return ad.maximum(x, ad.cos(y))
 
 dog_elementwise_tests = [
     TestFunc(tensor_courpus_dog_add, dog_post_brodacast_strategy()),
@@ -826,45 +896,71 @@ dog_elementwise_tests = [
 
 all_pairs_tests = [
     TestFunc(tensor_courpus_add_mul, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_add_div, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_div, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        non_zero_float_strategy(min_value=-10.0, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_add_pow, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_add_exp, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_add_log, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_log, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_add_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_add_cos, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_add_min, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_add_max, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_min, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_add_max, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_mul, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_sub_div, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_div, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        non_zero_float_strategy(min_value=-10.0, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_sub_pow, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_exp, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_sub_log, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_log, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_sub_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sub_cos, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_sub_min, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_sub_max, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_mul_div, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_min, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_sub_max, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_mul_div, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        non_zero_float_strategy(min_value=-10.0, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_mul_pow, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_exp, broadcasted_elementwise_strategy(2)),
-    TestFunc(tensor_courpus_mul_log, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_mul_log, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    ])),
     TestFunc(tensor_courpus_mul_sin, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_mul_cos, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_mul_min, broadcasted_elementwise_strategy(2)),
-    #TestFunc(tensor_courpus_mul_max, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_mul_min, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_mul_max, broadcasted_elementwise_strategy(2)),
     TestFunc(tensor_courpus_sin_cos, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_cos_sin, broadcasted_elementwise_strategy(1)),
-    TestFunc(tensor_courpus_exp_log, broadcasted_elementwise_strategy(1)),
+    TestFunc(tensor_courpus_exp_log, broadcasted_elementwise_strategy(1, values=
+         positive_float_strategy(min_value=0.1, max_value=10.0)
+    )),
     TestFunc(tensor_courpus_log_exp, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_min_max, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_max_min, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_min_exp, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_min_log, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_min_sin, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_min_cos, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_max_exp, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_max_log, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_max_sin, broadcasted_elementwise_strategy(1)),
-    # TestFunc(tensor_courpus_max_cos, broadcasted_elementwise_strategy(1)),
+    TestFunc(tensor_courpus_min_max, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_max_min, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_min_exp, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_min_log, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    ])),
+    TestFunc(tensor_courpus_min_sin, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_min_cos, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_max_exp, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_max_log, broadcasted_elementwise_strategy(2, values=[
+        st.floats(allow_infinity=False, allow_nan=False, min_value=-10.0, max_value=10.0),
+        positive_float_strategy(min_value=0.1, max_value=10.0)
+    ])),
+    TestFunc(tensor_courpus_max_sin, broadcasted_elementwise_strategy(2)),
+    TestFunc(tensor_courpus_max_cos, broadcasted_elementwise_strategy(2)),
 ]
 
 basic_tensor_tests = [
