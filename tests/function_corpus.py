@@ -13,27 +13,18 @@ def dog_general_strategy():
     """Generate test cases for dog operations with general tensor shapes."""
     # Generate reasonable dimensions for tensor shapes
     sizes = st.integers(min_value=1, max_value=5)
-    shape_strategy = st.lists(sizes, min_size=0, max_size=4).map(tuple)
+    shapes = st.lists(sizes, min_size=0, max_size=4).map(tuple)
 
     # Generate compatible shapes for binary operations
-    def generate_compatible_shapes():
-        base_shape = shape_strategy.example()
-        broadcast_dims = st.integers(min_value=0, max_value=len(base_shape))
-        return st.tuples(
-            st.just(base_shape),
-            broadcast_dims.map(lambda n: base_shape[-n:] if n > 0 else ())
-        )
+    binary_shapes = st.tuples(shapes, shapes)
 
-    # Generate arrays with the given shapes
-    def make_array(shape):
-        return np.random.uniform(-10.0, 10.0, size=shape)
+    # Create ArgSpec for the shapes
+    def make_arg_spec(shape):
+        return pt.leaf(ad.ArgSpec(np.float64, shape))
 
-    return st.tuples(
-        generate_compatible_shapes(),
-        st.floats(min_value=-10.0, max_value=10.0)
-    ).map(lambda x: (
-        make_array(x[0][0]),
-        make_array(x[0][1])
+    return binary_shapes.map(lambda shapes: (
+        make_arg_spec(shapes[0]),
+        make_arg_spec(shapes[1])
     ))
 
 @ad.jit
@@ -49,9 +40,9 @@ def tensor_corpus_dog_max(x, y):
 @ad.jit
 def tensor_corpus_dog_reshape(x):
     """Reshape tensor to a compatible shape."""
-    if x.size > 0:
-        new_shape = (-1,)
-        return np.reshape(x, new_shape)
+    shape = np.shape(x)
+    if shape[0] > 0:
+        return np.reshape(x, (-1,))
     return x
 
 @ad.jit
@@ -66,6 +57,6 @@ def tensor_corpus_dog_broadcast(x, y):
 dog_elementwise_tests = [
     TestFunc(tensor_corpus_dog_min, dog_general_strategy()),
     TestFunc(tensor_corpus_dog_max, dog_general_strategy()),
-    TestFunc(tensor_corpus_dog_reshape, dog_general_strategy()),
+    TestFunc(tensor_corpus_dog_reshape, dog_general_strategy().map(lambda x: (x[0],))),
     TestFunc(tensor_corpus_dog_broadcast, dog_general_strategy())
 ]
