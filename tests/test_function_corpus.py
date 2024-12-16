@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st
-from .function_corpus import dog_elementwise_tests
+from function_corpus import dog_elementwise_tests
 
 @pytest.mark.parametrize("test_func", dog_elementwise_tests)
 @given(st.data())
