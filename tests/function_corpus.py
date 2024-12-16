@@ -10,7 +10,7 @@ from hypothesis.extra.numpy import arrays
 class TestFunc:
     function: Callable
     arg_strategy: Any
-    static_argnames: frozenset = dataclasses.field(default_factory=lambda: frozenset())
+    static_argnames: set = dataclasses.field(default_factory=lambda: set())
 
 def shape_strategy():
     # Generate reasonable dimensions for tensor shapes
@@ -170,113 +170,110 @@ def transpose_strategy():
 
     return base_shape.flatmap(combine_shape_axes)
 
-def reshape_strategy():
-    # Generate base shape with non-zero total size
-    def valid_shape():
-        return st.lists(
-            st.integers(min_value=1, max_value=5),
-            min_size=1,
-            max_size=4
-        ).map(tuple)
+@st.composite
+def reshape_strategy(draw):
+    prod = draw(st.integers(min_value=1, max_value=50))
+    factors = []
+    for f in [2, 3, 4, 5]:
+        while prod % f:
+            factors.append(f)
+            prod = prod // f
 
-    base_shape = st.shared(valid_shape())
+    n_splits1 = draw(st.integers(min_value=0, max_value=len(factors)-1))
+    n_splits2 = draw(st.integers(min_value=0, max_value=len(factors)-1))
 
-    def generate_targets(shape):
-        total_size = np.prod(shape)
+    rng = draw(st.randoms())
+    split_points1 = sorted(rng.sample(range(len(factors)), n_splits1))
+    split_points2 = sorted(rng.sample(range(len(factors)), n_splits2))
 
-        # Generate valid target shapes that preserve total size
-        def valid_targets():
-            return st.lists(
-                st.integers(min_value=1, max_value=total_size),
-                min_size=1,
-                max_size=4
-            ).map(tuple).filter(lambda x: np.prod(x) == total_size)
+    #print("split points 1: ", split_points1)
+    #print("split points 2: ", split_points2)
 
-        # Add possible -1 dimension
-        def add_minus_one(shape):
-            if len(shape) <= 1:
-                return shape
-            pos = np.random.randint(len(shape))
-            new_shape = list(shape)
-            new_shape[pos] = -1
-            return tuple(new_shape)
+    def split(lst, split_points):
+        start = 0
+        for end in split_points:
+            yield int(np.prod(lst[start:end], dtype=np.int64))
+            start = end
+        if len(lst[start:]) != 0:
+            yield int(np.prod(lst[start:], dtype=np.int64))
 
-        target_shape = valid_targets() | valid_targets().map(add_minus_one)
+    f1 = rng.sample(factors, len(factors))
+    f2 = rng.sample(factors, len(factors))
 
-        return st.tuples(
-            arrays(
+    #print("factors: ", factors)
+    #print("f1: ", f1)
+    #print("f2: ", f2)
+
+    shape1 = tuple(split(f1, split_points1))
+    shape2 = tuple(split(f2, split_points2))
+
+    #print("shape1: ", shape1)
+    #print("shape2: ", shape2)
+
+    arr = draw(arrays(
+        np.dtype('float64'),
+        shape=shape1,
+        elements=st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
+        )
+    ))
+
+    return (arr, shape2)
+
+def broadcast_strategy():
+    @st.composite
+    def inner_strategy(draw):
+        # Generate target shape
+        target = draw(shape_strategy())
+
+        # If target is empty tuple, source must be empty too
+        if len(target) == 0:
+            return (draw(arrays(
                 np.dtype('float64'),
-                shape=shape,
+                shape=(),
                 elements=st.floats(
                     allow_infinity=False,
                     allow_nan=False,
                     min_value=-10.0,
                     max_value=10.0
                 )
-            ),
-            target_shape
-        )
-
-    return base_shape.flatmap(generate_targets)
-
-def broadcast_strategy():
-    # Generate target shape
-    target_shape = shape_strategy()
-
-    def generate_source(target):
-        # If target is empty tuple, source must be empty too
-        if len(target) == 0:
-            return st.tuples(
-                arrays(
-                    np.dtype('float64'),
-                    shape=(),
-                    elements=st.floats(
-                        allow_infinity=False,
-                        allow_nan=False,
-                        min_value=-10.0,
-                        max_value=10.0
-                    )
-                ),
-                st.just(target)
-            )
+            )), target)
 
         # For each dimension, we can either:
         # 1. Keep the original size
         # 2. Replace with size 1 for broadcasting
-        # 3. Drop the dimension entirely (but only for leading dims)
         source_dims = []
         for i, size in enumerate(target):
-            choice = st.one_of(
+            choice = draw(st.one_of(
                 st.just(size),
                 st.just(1)
-            )
+            ))
             source_dims.append(choice)
 
         # Generate length to slice dimensions to
-        length = st.integers(min_value=1, max_value=len(target))
+        length = draw(st.integers(min_value=0, max_value=len(target)))
 
-        def make_shape(dims, length):
-            return tuple(dims[length:])
+        # Create final shape by dropping leading dims
+        final_shape = tuple(source_dims[length:])
 
-        return st.tuples(
-            length.map(
-                lambda x: make_shape(source_dims, x)
-            ).flatmap(
-                lambda shape: arrays(
-                    np.dtype('float64'),
-                    shape=shape,
-                    elements=st.floats(
-                        allow_infinity=False,
-                        allow_nan=False,
-                        min_value=-10.0,
-                        max_value=10.0
-                    )
-                )
-            ),
-            st.just(target)
-        )
+        # Generate source array with this shape
+        source = draw(arrays(
+            np.dtype('float64'),
+            shape=final_shape,
+            elements=st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+        ))
 
-    return target_shape.flatmap(generate_source)
+        return (source, target)
+
+    return inner_strategy()
 
 def non_zero_float_strategy(min_value=-10.0, max_value=10.0, epsilon=1e-3):
     @st.composite
@@ -881,8 +878,8 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_sum, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_max, broadcasted_elementwise_strategy(1)),
     TestFunc(tensor_courpus_min, broadcasted_elementwise_strategy(1)),
-    #TestFunc(tensor_courpus_reshape, reshape_strategy(), static_argnames={'shape'}),
-    #TestFunc(tensor_courpus_broadcast, broadcast_strategy(), static_argnames={'shape'}),
+    TestFunc(tensor_courpus_reshape, reshape_strategy(), static_argnames={'shape'}),
+    TestFunc(tensor_courpus_broadcast, broadcast_strategy(), static_argnames={'shape'}),
 ]
 
 def get_test_samples(test_set):
@@ -899,3 +896,12 @@ def get_test_samples(test_set):
         return (test_func.function, args, test_func.static_argnames)
 
     return test_sample_strategy()
+
+if __name__ == '__main__':
+    # Draw a few samples from reshape_strategy()
+    for i in range(5):
+        arr, shape = reshape_strategy().example()
+        print(f"\nSample {i+1}:")
+        print(f"Original array shape: {arr.shape}")
+        print(f"Reshape target: {shape}")
+        print(f"Reshaped array shape: {arr.reshape(shape).shape}")
