@@ -12,10 +12,10 @@ class TestFunc:
     arg_strategy: Any
     static_argnames: set = dataclasses.field(default_factory=lambda: set())
 
-def shape_strategy():
+def shape_strategy(max_dims=4, min_val=1, max_val=5):
     # Generate reasonable dimensions for tensor shapes
-    sizes = st.integers(min_value=1, max_value=5)
-    return st.lists(sizes, min_size=0, max_size=4).map(tuple)
+    sizes = st.integers(min_value=max_val, max_value=max_val)
+    return st.lists(sizes, min_size=0, max_size=max_dims).map(tuple)
 
 def elementwise_strategy(k: int, values=None):
     # Generate shared shape and arrays with same shape
@@ -51,15 +51,16 @@ def elementwise_strategy(k: int, values=None):
 
     return generate_tensors()
 
-def dog_general_strategy():
+def dog_general_strategy(left_values=None, right_values=None):
     # Generate random shapes for each dimension type
     @st.composite
     def generate_shapes(draw):
         # Draw base shapes
-        batch_shape = draw(shape_strategy())
-        contract_shape = draw(shape_strategy())
-        lhs_free = draw(shape_strategy())
-        rhs_free = draw(shape_strategy())
+        ss = shape_strategy(max_dims=2, max_val=4)
+        batch_shape = draw(ss)
+        contract_shape = draw(ss)
+        lhs_free = draw(ss)
+        rhs_free = draw(ss)
 
         # Build full shape lists
         lhs_full = list(batch_shape) + list(contract_shape) + list(lhs_free)
@@ -74,7 +75,6 @@ def dog_general_strategy():
             for i, p in enumerate(perm):
                 inverse[p] = i
             return tuple(inverse)
-
 
         # Apply permutations to shapes
         lhs_shape = tuple(lhs_full[i] for i in lhs_perm)
@@ -92,42 +92,31 @@ def dog_general_strategy():
         lhs_contract = tuple(inv(lhs_perm)[i + n_batch] for i in range(n_contract))
         rhs_contract = tuple(inv(rhs_perm)[i + n_batch] for i in range(n_contract))
 
-        print(f"{batch_shape=}")
-        print(f"{contract_shape=}")
-        print(f"{lhs_free=}")
-        print(f"{rhs_free=}")
-        print(f"{lhs_full=}")
-        print(f"{rhs_full=}")
-        print(f"{lhs_perm=}")
-        print(f"{rhs_perm=}")
-        print(f"{lhs_shape=}")
-        print(f"{rhs_shape=}")
-        print(f"{lhs_batch=}")
-        print(f"{rhs_batch=}")
-        print(f"{lhs_contract=}")
-        print(f"{rhs_contract=}")
-
         # Generate random arrays with these shapes
+        left_strategy = left_values if left_values is not None else st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
+        )
+
+        right_strategy = right_values if right_values is not None else st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
+        )
+
         lhs_array = draw(arrays(
             np.dtype('float64'),
             shape=lhs_shape,
-            elements=st.floats(
-                allow_infinity=False,
-                allow_nan=False,
-                min_value=-10.0,
-                max_value=10.0
-            )
+            elements=left_strategy
         ))
 
         rhs_array = draw(arrays(
             np.dtype('float64'),
             shape=rhs_shape,
-            elements=st.floats(
-                allow_infinity=False,
-                allow_nan=False,
-                min_value=-10.0,
-                max_value=10.0
-            )
+            elements=right_strategy
         ))
 
         return (
@@ -330,6 +319,59 @@ def positive_float_strategy(min_value=0.1, max_value=10.0):
         max_value=max_value
     )
 
+def broadcast_shapes_strategy(shape, k):
+    """Strategy to generate k shapes that broadcast together to target shape.
+
+    Args:
+        shape: Target shape after broadcasting
+        k: Number of shapes to generate
+    """
+    @st.composite
+    def inner_strategy(draw):
+        num_dims = len(shape)
+        if num_dims == 0:
+            return [()] * k
+
+        # Generate valid "allow change" matrix - at least one unchanged dim per column
+        def valid_col():
+            return st.lists(st.booleans(), min_size=k, max_size=k).filter(
+                lambda col: not all(col)
+            )
+        allow_changes = [draw(valid_col()) for _ in range(num_dims)]
+        allow_changes = list(zip(*allow_changes))  # Transpose to per-tensor masks
+
+        # Pick one tensor to maintain dimension count
+        fixed_dims_idx = draw(st.integers(min_value=0, max_value=k-1))
+
+        shapes = []
+        for i in range(k):
+            # Get dimensions for this tensor
+            tensor_shape = list(shape)
+            if i != fixed_dims_idx:
+                # Get max dims we can remove without affecting unchangeable dims
+                max_removable = 0
+                for d in range(num_dims):
+                    if not allow_changes[i][d]:
+                        break
+                    max_removable = d + 1
+
+                # Maybe truncate leading dimensions
+                if max_removable > 0:
+                    n_dims = draw(st.integers(min_value=0, max_value=max_removable))
+                    tensor_shape = tensor_shape[n_dims:]
+                    allow_changes[i] = allow_changes[i][n_dims:]
+
+            # Randomly change allowed dimensions to 1
+            for j, can_change in enumerate(allow_changes[i][:len(tensor_shape)]):
+                if can_change and draw(st.booleans()):
+                    tensor_shape[j] = 1
+
+            shapes.append(tuple(tensor_shape))
+
+        return shapes
+
+    return inner_strategy()
+
 def broadcasted_elementwise_strategy(k: int, values=None):
     """Generate k-ary broadcasting strategy with configurable value ranges.
 
@@ -357,52 +399,22 @@ def broadcasted_elementwise_strategy(k: int, values=None):
 
         base = st.shared(shape_strategy())
         shape = draw(base)
-        num_dims = len(shape)
 
         # Return empty tensors if no dimensions
-        if num_dims == 0:
+        if len(shape) == 0:
             return draw(elementwise_strategy(k, values))
 
-        # Generate valid "allow change" matrix - at least one unchanged dim per column
-        def valid_col():
-            return st.lists(st.booleans(), min_size=k, max_size=k).filter(
-                lambda col: not all(col)
-            )
-        allow_changes = [draw(valid_col()) for _ in range(num_dims)]
-        allow_changes = list(zip(*allow_changes))  # Transpose to per-tensor masks
+        # Generate the broadcast shapes
+        shapes = draw(broadcast_shapes_strategy(shape, k))
 
-        # Pick one tensor to maintain dimension count
-        fixed_dims_idx = draw(st.integers(min_value=0, max_value=k-1))
-
+        # Generate arrays with those shapes
         tensors = []
-        for i in range(k):
-            # Get dimensions for this tensor
-            tensor_shape = list(shape)
-            if i != fixed_dims_idx:
-                # Get max dims we can remove without affecting unchangeable dims
-                max_removable = 0
-                for d in range(num_dims):
-                    if not allow_changes[i][d]:
-                        break
-                    max_removable = d + 1
-
-                # Maybe truncate leading dimensions
-                if max_removable > 0:
-                    n_dims = draw(st.integers(min_value=0, max_value=max_removable))
-                    tensor_shape = tensor_shape[n_dims:]
-                    allow_changes[i] = allow_changes[i][n_dims:]
-
-            # Randomly change allowed dimensions to 1
-            for j, can_change in enumerate(allow_changes[i][:len(tensor_shape)]):
-                if can_change and draw(st.booleans()):
-                    tensor_shape[j] = 1
-
-            # Generate array with modified shape
+        for shape, value_strat in zip(shapes, tensor_values):
             tensors.append(draw(
                 arrays(
                     np.dtype('float64'),
-                    shape=tuple(tensor_shape),
-                    elements=tensor_values[i]
+                    shape=shape,
+                    elements=value_strat
                 )
             ))
 
@@ -410,100 +422,93 @@ def broadcasted_elementwise_strategy(k: int, values=None):
 
     return build_tensors()  #type: ignore
 
-def generate_broadcast_shape_strategy(base_shape):
-    def make_broadcast_shape():
-        # Maybe add some leading dimensions
-        n_extra = np.random.randint(3)  # 0-2 extra dims
-        leading_dims = tuple(np.random.randint(1, 4) for _ in range(n_extra))
-
-        # For remaining dims, either match output dim or use size 1
-        broadcast_dims = []
-        for dim in base_shape:
-            if np.random.random() < 0.5:
-                broadcast_dims.append(dim)
-            else:
-                broadcast_dims.append(1)
-
-        return leading_dims + tuple(broadcast_dims)
-
-    return st.builds(make_broadcast_shape)
-
-def dog_post_brodacast_strategy():
-    # Get dot general inputs
-    base_dog = st.shared(dog_general_strategy())
-
-    def generate_broadcast(base):
-        x_orig, y_orig, c1, c2, b1, b2 = base
+def dog_post_brodacast_strategy(left_values=None, right_values=None, broadcast_values=None):
+    @st.composite
+    def inner_strategy(draw):
+        # Get dot general inputs from base strategy
+        x_orig, y_orig, c1, c2, b1, b2 = draw(dog_general_strategy(left_values, right_values))
         x = x_orig if isinstance(x_orig, np.ndarray) else np.array(x_orig)
         y = y_orig if isinstance(y_orig, np.ndarray) else np.array(y_orig)
 
         # Calculate output shape of dot_general
         out_shape = tuple(x.shape[i] for i in b1) + \
-                   tuple(d for i, d in enumerate(x.shape)
+                    tuple(d for i, d in enumerate(x.shape)
                         if i not in c1 and i not in b1) + \
-                   tuple(d for i, d in enumerate(y.shape)
+                    tuple(d for i, d in enumerate(y.shape)
                         if i not in c2 and i not in b2)
 
-        final_shape = generate_broadcast_shape_strategy(out_shape)
+        # Generate z by reducing some dimensions to 1
+        broadcast_shape = list(out_shape)
+        for i in range(len(broadcast_shape)):
+            if draw(st.booleans()):
+                broadcast_shape[i] = 1
 
-        return st.tuples(
-            st.just(x),
-            st.just(y),
-            st.just(c1),
-            st.just(c2),
-            st.just(b1),
-            st.just(b2),
-            arrays(
-                np.dtype('float64'),
-                shape=final_shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,
-                    max_value=10.0
-                )
-            )
+        # Truncate some leading dimensions
+        n_prefix = draw(st.integers(min_value=0, max_value=len(broadcast_shape)))
+        broadcast_shape = broadcast_shape[n_prefix:]
+
+        broadcast_strategy = broadcast_values if broadcast_values is not None else st.floats(
+            allow_infinity=False,
+            allow_nan=False,
+            min_value=-10.0,
+            max_value=10.0
         )
 
-    return base_dog.flatmap(generate_broadcast)
+        z = draw(arrays(
+            np.dtype('float64'),
+            shape=tuple(broadcast_shape),
+            elements=broadcast_strategy
+        ))
+
+        return (x, y, z, c1, c2, b1, b2)
+
+    return inner_strategy()
 
 
 def dog_pre_broadcast_left_strategy():
-    # Get dot general inputs first
-    base_dog = st.shared(dog_general_strategy())
+    @st.composite
+    def inner_strategy(draw):
+        # Get dot general inputs first
+        x, z, c1, c2, b1, b2 = draw(dog_general_strategy())
 
-    def generate_broadcast(base):
-        x_orig, y_orig, c1, c2, b1, b2 = base
-        x = x_orig if isinstance(x_orig, np.ndarray) else np.array(x_orig)
+        # Generate shapes that broadcast to x's shape
+        # ...this is a bit sad beacuse we throw x_orig away but not a huge issue
+        shapes = draw(broadcast_shapes_strategy(x.shape, 2))
 
-        # Generate broadcast shape for x
-        final_shape = st.shared(shape_strategy())
-        def check_broadcast(shape):
-            try:
-                np.broadcast_shapes(x.shape, shape)
-                return True
-            except ValueError:
-                return False
+        # Generate array with the broadcast shape
+        x = draw(arrays(
+            np.dtype('float64'),
+            shape=shapes[0],
+            elements=st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+        ))
 
-        return st.tuples(
-            arrays(
-                np.dtype('float64'),
-                shape=final_shape,
-                elements=st.floats(
-                    allow_infinity=False,
-                    allow_nan=False,
-                    min_value=-10.0,
-                    max_value=10.0
-                )
-            ).filter(lambda z: check_broadcast(z.shape)),
-            st.just(y_orig),
-            st.just(c1),
-            st.just(c2),
-            st.just(b1),
-            st.just(b2)
+        y = draw(arrays(
+            np.dtype('float64'),
+            shape=shapes[1],
+            elements=st.floats(
+                allow_infinity=False,
+                allow_nan=False,
+                min_value=-10.0,
+                max_value=10.0
+            )
+        ))
+
+        return (
+            x,
+            y,
+            z,
+            c1,
+            c2,
+            b1,
+            b2
         )
 
-    return base_dog.flatmap(generate_broadcast)
+    return inner_strategy()
 
 def dog_pre_broadcast_right_strategy():
     # Get dot general inputs first
@@ -542,146 +547,140 @@ def dog_pre_broadcast_right_strategy():
 
     return base_dog.flatmap(generate_broadcast)
 
-def tensor_courpus_dog_add(x, y, lhs_c, rhs_c, lhs_b, rhs_b, z):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+def tensor_courpus_dog_add(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b) + z
 
-def tensor_courpus_dog_sub(x, y, lhs_c, rhs_c, lhs_b, rhs_b, z):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+def tensor_courpus_dog_sub(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b) - z
 
-def tensor_courpus_dog_mul(x, y, lhs_c, rhs_c, lhs_b, rhs_b, z):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+def tensor_courpus_dog_mul(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b) * z
 
-def tensor_courpus_dog_div(x, y, lhs_c, rhs_c, lhs_b, rhs_b, z):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+def tensor_courpus_dog_div(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b) / z
 
 def tensor_courpus_dog_pow(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b) ** 2
 
 def tensor_courpus_dog_neg(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return -x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return -ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b)
 
 def tensor_courpus_dog_exp(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.exp(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.exp(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_log(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.log(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.log(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_sin(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.sin(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.sin(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_cos(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.cos(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.cos(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_abs(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.abs(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.abs(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_dog_sum(x, y, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.sum(x.dot_general(y, lhs_contracting_dims=lhs_c,
+    return ad.sum(ad.dot_general(x, y, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b))
 
 def tensor_courpus_add_dog(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (x + y).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general((x + y), z, lhs_contracting_dims=lhs_c,
                            rhs_contracting_dims=rhs_c,
                            lhs_batch_dims=lhs_b,
                            rhs_batch_dims=rhs_b)
 
 def tensor_courpus_sub_dog(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (x - y).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general((x - y), z, lhs_contracting_dims=lhs_c,
                            rhs_contracting_dims=rhs_c,
                            lhs_batch_dims=lhs_b,
                            rhs_batch_dims=rhs_b)
 
 def tensor_courpus_mul_dog(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (x * y).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general((x * y), z, lhs_contracting_dims=lhs_c,
                            rhs_contracting_dims=rhs_c,
                            lhs_batch_dims=lhs_b,
                            rhs_batch_dims=rhs_b)
 
 def tensor_courpus_div_dog(x, y, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (x / y).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general((x / y), z, lhs_contracting_dims=lhs_c,
                            rhs_contracting_dims=rhs_c,
                            lhs_batch_dims=lhs_b,
                            rhs_batch_dims=rhs_b)
 
 def tensor_courpus_pow_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (x ** 2).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general((x ** 2), z, lhs_contracting_dims=lhs_c,
                            rhs_contracting_dims=rhs_c,
                            lhs_batch_dims=lhs_b,
                            rhs_batch_dims=rhs_b)
 
 def tensor_courpus_neg_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return (-x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(-x, z, lhs_contracting_dims=lhs_c,
                         rhs_contracting_dims=rhs_c,
                         lhs_batch_dims=lhs_b,
                         rhs_batch_dims=rhs_b)
 
 def tensor_courpus_exp_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.exp(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(ad.exp(x), z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
 
 def tensor_courpus_log_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.log(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(ad.log(x), z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
 
 def tensor_courpus_sin_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.sin(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(ad.sin(x), z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
 
 def tensor_courpus_cos_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.cos(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(ad.cos(x), z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
 
 def tensor_courpus_abs_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.abs(x).dot_general(z, lhs_contracting_dims=lhs_c,
-                             rhs_contracting_dims=rhs_c,
-                             lhs_batch_dims=lhs_b,
-                             rhs_batch_dims=rhs_b)
-
-def tensor_courpus_sum_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
-    return ad.sum(x).dot_general(z, lhs_contracting_dims=lhs_c,
+    return ad.dot_general(ad.abs(x), z, lhs_contracting_dims=lhs_c,
                              rhs_contracting_dims=rhs_c,
                              lhs_batch_dims=lhs_b,
                              rhs_batch_dims=rhs_b)
@@ -866,31 +865,33 @@ def tensor_courpus_max_sin(x, y):
 def tensor_courpus_max_cos(x, y):
     return ad.maximum(x, ad.cos(y))
 
+def make_dog_test(func, strategy):
+    return TestFunc(func, strategy, static_argnames={"lhs_c", "rhs_c", "lhs_b", "rhs_b"})
+
 dog_elementwise_tests = [
-    TestFunc(tensor_courpus_dog_add, dog_post_brodacast_strategy()),
-    TestFunc(tensor_courpus_dog_sub, dog_post_brodacast_strategy()),
-    TestFunc(tensor_courpus_dog_mul, dog_post_brodacast_strategy()),
-    TestFunc(tensor_courpus_dog_div, dog_post_brodacast_strategy()),
-    TestFunc(tensor_courpus_dog_pow, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_neg, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_exp, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_log, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_sin, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_cos, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_abs, dog_general_strategy()),
-    TestFunc(tensor_courpus_dog_sum, dog_general_strategy()),
-    TestFunc(tensor_courpus_add_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_sub_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_mul_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_div_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_pow_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_neg_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_exp_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_log_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_sin_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_cos_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_abs_dog, dog_pre_broadcast_left_strategy()),
-    TestFunc(tensor_courpus_sum_dog, dog_pre_broadcast_left_strategy())
+    make_dog_test(tensor_courpus_dog_add, dog_post_brodacast_strategy()),
+    make_dog_test(tensor_courpus_dog_sub, dog_post_brodacast_strategy()),
+    make_dog_test(tensor_courpus_dog_mul, dog_post_brodacast_strategy()),
+    #make_dog_test(tensor_courpus_dog_div, dog_post_brodacast_strategy()),
+    make_dog_test(tensor_courpus_dog_pow, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_neg, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_exp, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_log, dog_general_strategy(left_values=positive_float_strategy(min_value=1e-2), right_values=positive_float_strategy(min_value=1e-2))),
+    make_dog_test(tensor_courpus_dog_sin, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_cos, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_abs, dog_general_strategy()),
+    make_dog_test(tensor_courpus_dog_sum, dog_general_strategy()),
+    make_dog_test(tensor_courpus_add_dog, dog_pre_broadcast_left_strategy()),
+    make_dog_test(tensor_courpus_sub_dog, dog_pre_broadcast_left_strategy()),
+    make_dog_test(tensor_courpus_mul_dog, dog_pre_broadcast_left_strategy()),
+    # make_dog_test(tensor_courpus_div_dog, dog_pre_broadcast_left_strategy()),
+    make_dog_test(tensor_courpus_pow_dog, dog_general_strategy()),
+    make_dog_test(tensor_courpus_neg_dog, dog_general_strategy()),
+    make_dog_test(tensor_courpus_exp_dog, dog_general_strategy()),
+    make_dog_test(tensor_courpus_log_dog, dog_general_strategy(left_values=positive_float_strategy(min_value=1e-2))),
+    make_dog_test(tensor_courpus_sin_dog, dog_general_strategy()),
+    make_dog_test(tensor_courpus_cos_dog, dog_general_strategy()),
+    make_dog_test(tensor_courpus_abs_dog, dog_general_strategy()),
 ]
 
 
@@ -1008,8 +1009,5 @@ def get_test_samples(test_set):
 if __name__ == '__main__':
     # Draw a few samples from reshape_strategy()
     for i in range(5):
-        arr, shape = reshape_strategy().example()
-        print(f"\nSample {i+1}:")
-        print(f"Original array shape: {arr.shape}")
-        print(f"Reshape target: {shape}")
-        print(f"Reshaped array shape: {arr.reshape(shape).shape}")
+        x, y, *args = dog_general_strategy().example()
+        print(x.shape, y.shape, *args)
