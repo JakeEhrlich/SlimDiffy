@@ -7,7 +7,7 @@ import numpy as np # type: ignore
 from collections import defaultdict
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union, Callable
 import inspect
 from enum import Enum
 import slimdiffy.pytree as pt
@@ -711,9 +711,20 @@ class Interpreter:
         # Process equations
         for i, eq in enumerate(lambda_expr.equations):
             self.results[i] = self.visit(eq)
+            print(f"Index {i}: {self.results[i]}")  # Debug print
 
         # Use pytree to construct result
-        def get_result(idx: int) -> Any:
+        def get_result(idx: Union[int, tuple, Tracer]) -> Any:
+            print(f"Getting result for idx: {idx}")  # Debug print
+            print(f"Available indices: {list(self.results.keys())}")  # Debug print
+            if isinstance(idx, tuple):
+                # Handle tuple indices by recursively getting each element
+                return tuple(get_result(i) for i in idx)
+            if isinstance(idx, Tracer):
+                # If we get a Tracer, return it directly
+                return idx
+            if idx not in self.results:
+                raise KeyError(f"Index {idx} not found in results. Available indices: {list(self.results.keys())}")
             return self.results[idx]
 
         result_tree = pt.map(get_result, lambda_expr.result)
@@ -1004,8 +1015,11 @@ class Gradient:
         pass
 
     def visit_add(self, eq: Op, derivative: Tracer) -> None:
-        self.derivatives[eq.inputs[0]] += derivative
-        self.derivatives[eq.inputs[1]] += derivative
+        for input_idx in eq.inputs:
+            if isinstance(derivative, pt.Node):
+                derivative = derivative.leaf_value
+            # For addition, derivative wrt each input is just the derivative
+            self.derivatives[input_idx] = _ensure_tracer(derivative, self.supervisor)
 
     def visit_mul(self, eq: Op, derivative: Tracer) -> None:
         a, b = [self.equation_map[idx] for idx in eq.inputs]
@@ -1187,10 +1201,16 @@ class Gradient:
 
         # Get result node(s)
         results = []
+        print("\nGradient.__call__ debug:")  # Debug print
+        print(f"Initial lambda_expr.result: {lambda_expr.result}")  # Debug print
         pt.map(lambda idx: results.append(idx), lambda_expr.result)
+        print(f"Collected results: {results}")  # Debug print
 
         # Copy over original equations
         self.equation_map = [Tracer(eq, self.supervisor) for eq in lambda_expr.equations]
+        print(f"Number of equations: {len(lambda_expr.equations)}")  # Debug print
+        for i, eq in enumerate(lambda_expr.equations):
+            print(f"Equation {i}: {eq}")  # Debug print
 
         # Filter args if specified
         if self.wrt_args is not None:
@@ -1201,17 +1221,18 @@ class Gradient:
         # Compute derivatives for each output
         all_derivatives = []
         for result_idx in results:
+            print(f"\nProcessing result_idx: {result_idx}")  # Debug print
             # reinit derivatives for this output
             self.derivatives = defaultdict(lambda: _ensure_tracer(0.0, self.supervisor))
 
-            # Initialize derivative of result wrt result as 1.0
-            if self.gradient_only:
-                self.derivatives[result_idx] = _ensure_tracer(1.0, self.supervisor)
-            else:
-                # Create identity jacobian mapping from result shape to result shape
-                result_eq = lambda_expr.equations[result_idx]
-                identity = np.eye(np.prod(result_eq.shape)).reshape(result_eq.shape + result_eq.shape)
-                self.derivatives[result_idx] = _ensure_tracer(identity, self.supervisor)
+            # Initialize derivative of result wrt result as identity matrix
+            result_eq = lambda_expr.equations[result_idx]
+            print(f"Creating identity jacobian for result_idx {result_idx}, shape {result_eq.shape}")  # Debug print
+            # For a tensor of shape (n,), we need an identity matrix of shape (n,n)
+            # Reshape to match output dimensions for proper broadcasting
+            identity = np.eye(np.prod(result_eq.shape)).reshape(result_eq.shape + result_eq.shape)
+            self.derivatives[result_idx] = _ensure_tracer(identity, self.supervisor)
+            print(f"Initial derivatives: {dict(self.derivatives)}")  # Debug print
 
             # Work backwards through equations propagating derivatives
             for i in range(len(lambda_expr.equations)-1, -1, -1):
@@ -1226,9 +1247,15 @@ class Gradient:
 
             # Collect derivatives for this output
             def to_grad(idx):
-                return self.derivatives[idx].idx
+                if isinstance(idx, pt.Node):
+                    idx = idx.leaf_value
+                if idx not in self.derivatives:
+                    return _ensure_tracer(np.zeros(lambda_expr.equations[idx].shape + result_eq.shape), self.supervisor)
+                derivative = self.derivatives[idx]
+                return derivative
             derivatives = tuple(pt.map(to_grad, arg) for i, arg in enumerate(lambda_expr.args)
                              if active_args[i])
+            print(f"Derivatives for result {result_idx}: {derivatives}")  # Debug print
             all_derivatives.append(derivatives)
 
         # Create result based on gradient_only
@@ -1237,20 +1264,51 @@ class Gradient:
             result = all_derivatives[0]
             assert isinstance(result, tuple)
             # Pack into tuple/sequence if needed
-            # TODO: This is irregular, we should add an option
-            # to disable it for regularity
             if len(lambda_expr.args) == 1:
                 result = result[0]
             else:
                 result = pt.from_sequence(tuple(result))
         else:
             # Create tree of jacobians
-            def make_jacobian_node(out_node):
-                output_idx = results.index(out_node.leaf_value)
-                return all_derivatives[output_idx]
-            assert isinstance(lambda_expr.result, pt.Node)
-            result = pt.map(make_jacobian_node, lambda_expr.result)
-            assert isinstance(result, pt.Node)
+            def make_jacobian_node(result_idx, derivatives, output_results):
+                # Find which output this result corresponds to
+                out_node = lambda_expr.result
+                if isinstance(out_node, pt.Node):
+                    output_idx = output_results.index(out_node.leaf_value)
+                else:
+                    output_idx = output_results.index(result_idx)
+
+                # Get the result for each input
+                def get_result(idx):
+                    if isinstance(idx, pt.Node):
+                        idx = idx.leaf_value
+                    if isinstance(idx, tuple):
+                        return tuple(get_result(i) for i in idx)
+                    if isinstance(idx, Tracer):
+                        return idx
+                    # If idx is not in derivatives, return zero matrix of appropriate shape
+                    if idx not in self.derivatives:
+                        result_shape = lambda_expr.equations[result_idx].shape
+                        input_shape = lambda_expr.equations[idx].shape if idx < len(lambda_expr.equations) else (1,)
+                        zero_shape = input_shape + result_shape
+                        return _ensure_tracer(np.zeros(zero_shape), self.supervisor)
+                    return self.derivatives[idx]
+
+                derivative_results = tuple(get_result(d) for d in derivatives)
+                # Convert results to PyTree nodes
+                final_results = tuple(pt.leaf(r) if isinstance(r, Tracer) else r for r in derivative_results)
+                return pt.from_sequence(final_results)
+
+            result = [make_jacobian_node(result_idx, derivatives, results)
+                      for result_idx, derivatives in zip(results, all_derivatives)]
+            # Convert result list to PyTree if needed
+            if len(result) == 1:
+                result = result[0]
+                # Ensure result is a PyTree node
+                if not isinstance(result, pt.Node):
+                    result = pt.from_sequence(result)
+            else:
+                result = pt.from_sequence(result)
 
         return self.supervisor.create_lambda(lambda_expr.args, result)
 
@@ -1258,9 +1316,14 @@ class DeadCodeElimination:
     def __init__(self):
         self.used_equations = set()
 
-    def mark_used(self, result: Union[int, pt.Node]):
+    def mark_used(self, result: Union[int, pt.Node, tuple]):
         """Recursively mark all equations needed to compute result"""
-        if isinstance(result, int):
+        if isinstance(result, tuple):
+            # Handle tuple by recursively marking each element
+            for x in result:
+                self.mark_used(x)
+            return
+        elif isinstance(result, int):
             # Base case - mark this equation
             if result not in self.used_equations:
                 self.used_equations.add(result)
@@ -1280,7 +1343,7 @@ class DeadCodeElimination:
                     pass
                 else:
                     raise ValueError(f"Unknown equation type: {type(eq)}")
-        else:
+        elif isinstance(result, pt.Node):
             # Result is a PyTree - recursively process leaves
             if result.leaf_value is not None:
                 self.mark_used(result.leaf_value)
@@ -1314,7 +1377,13 @@ class DeadCodeElimination:
                 old_to_new[i] = len(new_equations) - 1
 
         # Update result indices
-        def update_index(idx: int) -> int:
+        def update_index(idx):
+            if isinstance(idx, tuple):
+                # Handle tuple of Nodes
+                idx = tuple(n.leaf_value if isinstance(n, pt.Node) else n for n in idx)
+            elif isinstance(idx, pt.Node):
+                # Handle single Node
+                idx = idx.leaf_value
             return old_to_new.get(idx, idx)
         assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
@@ -1359,8 +1428,14 @@ class CommonSubexpressionElimination:
             self.expr_to_idx[key] = old_to_new[i]
 
         # Update result indices
-        def update_index(idx: int) -> int:
-            return old_to_new[idx]
+        def update_index(idx):
+            if isinstance(idx, tuple):
+                # Handle tuple of Nodes by recursively handling each element
+                return tuple(update_index(x) for x in idx)
+            elif isinstance(idx, pt.Node):
+                # Handle single Node
+                idx = idx.leaf_value
+            return old_to_new.get(idx, idx)
         assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
         assert isinstance(new_result, pt.Node)
@@ -1399,7 +1474,13 @@ class ConstantFolding:
                 if all_constant:
                     # Can evaluate this expression
                     # Create minimal interpreter for just this op
-                    input_values = tuple(self.constants[idx] for idx in eq.inputs)
+                    input_values = tuple(self.constants.get(idx) for idx in eq.inputs)
+
+                    # Skip if any input values are None
+                    if any(v is None for v in input_values):
+                        new_equations.append(eq)
+                        old_to_new[i] = len(new_equations) - 1
+                        continue
 
                     supervisor = TracerSupervisor()
                     interpreter = Interpreter(input_values)
@@ -1417,14 +1498,20 @@ class ConstantFolding:
 
             # Not constant - update input indices and add to new equations
             if isinstance(eq, Op):
-                new_inputs = [old_to_new[idx] for idx in eq.inputs]
+                new_inputs = [old_to_new.get(idx, idx) for idx in eq.inputs]
                 eq = Op(eq.op, new_inputs, eq.dtype, eq.shape, eq.metadata)
             new_equations.append(eq)
             old_to_new[i] = len(new_equations) - 1
 
         # Update result indices
-        def update_index(idx: int) -> int:
-            return old_to_new[idx]
+        def update_index(idx):
+            if isinstance(idx, tuple):
+                # Handle tuple of Nodes by recursively handling each element
+                return tuple(update_index(x) for x in idx)
+            elif isinstance(idx, pt.Node):
+                # Handle single Node
+                idx = idx.leaf_value
+            return old_to_new.get(idx, idx)
         assert isinstance(lambda_expr.result, pt.Node)
         new_result = pt.map(update_index, lambda_expr.result)
         assert isinstance(new_result, pt.Node)
@@ -1474,8 +1561,14 @@ class AlgebraicSimplification:
                 self.old_to_new[i] = self.simplify(eq)
 
         # Update result indices
-        def update_index(idx: int) -> int:
-            return self.old_to_new[idx]
+        def update_index(idx):
+            if isinstance(idx, tuple):
+                # Handle tuple of Nodes by recursively handling each element
+                return tuple(update_index(x) for x in idx)
+            elif isinstance(idx, pt.Node):
+                # Handle single Node
+                idx = idx.leaf_value
+            return self.old_to_new.get(idx, idx)
         new_result = pt.map(update_index, lambda_expr.result)
         assert isinstance(new_result, pt.Node)
 

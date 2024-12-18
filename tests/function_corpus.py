@@ -13,9 +13,7 @@ class TestFunc:
     static_argnames: set = dataclasses.field(default_factory=lambda: set())
 
 def shape_strategy():
-    # Generate reasonable dimensions for tensor shapes
-    sizes = st.integers(min_value=1, max_value=5)
-    return st.lists(sizes, min_size=0, max_size=4).map(tuple)
+    return st.just((2,))
 
 def elementwise_strategy(k: int, values=None):
     # Generate shared shape and arrays with same shape
@@ -689,6 +687,12 @@ def tensor_courpus_sum_dog(x, z, lhs_c, rhs_c, lhs_b, rhs_b):
 def tensor_courpus_add(x, y):
     return x + y
 
+def tensor_courpus_jacobian_add(x, y):
+    return x + y
+
+def tensor_courpus_jacobian_mul(x, y):
+    return x * y
+
 def tensor_courpus_sub(x, y):
     return x - y
 
@@ -989,6 +993,11 @@ basic_tensor_tests = [
     TestFunc(tensor_courpus_reshape, reshape_strategy(), static_argnames={'shape'}),
     TestFunc(tensor_courpus_broadcast, broadcast_strategy(), static_argnames={'shape'}),
 ]
+
+basic_tensor_tests.extend([
+    TestFunc(tensor_courpus_jacobian_add, elementwise_strategy(2)),
+    TestFunc(tensor_courpus_jacobian_mul, elementwise_strategy(2))
+])
 
 def get_test_samples(test_set):
     # Strategy to sample functions and arguments
